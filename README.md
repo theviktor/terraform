@@ -6,6 +6,7 @@ Terraform configurations for deploying jambonz on various cloud providers.
 
 | Provider | VM (Mini) | VM (Medium) | VM (Large) |
 |----------|-----------|-------------|------------|
+| **AWS** | [VM Mini](aws/provision-vm-mini/) | [VM Medium](aws/provision-vm-medium/) | [VM Large](aws/provision-vm-large/) |
 | **Azure** | [VM Mini](azure/provision-vm-mini/) | [VM Medium](azure/provision-vm-medium/) | [VM Large](azure/provision-vm-large/) |
 | **GCP** | [VM Mini](gcp/provision-vm-mini/) | [VM Medium](gcp/provision-vm-medium/) | [VM Large](gcp/provision-vm-large/) |
 | **OCI** | [VM Mini](oci/provision-vm-mini/) | [VM Medium](oci/provision-vm-medium/) | [VM Large](oci/provision-vm-large/) |
