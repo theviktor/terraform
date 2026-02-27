@@ -1,0 +1,122 @@
+#cloud-config
+# Cloud-init for Jambonz RTP Server on Hetzner Cloud (Large deployment)
+# Handles RTPEngine and RTP-related sidecars only (no Drachtio)
+
+# Merge SSH keys into existing jambonz user
+users:
+  - name: jambonz
+    ssh_authorized_keys:
+      - "${ssh_public_key}"
+
+write_files:
+  - path: /tmp/configure-rtp.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash -xe
+      # Configuration script for jambonz RTP server
+
+      # Variables from Terraform
+      MONITORING_PRIVATE_IP="${monitoring_private_ip}"
+      VPC_CIDR="${vpc_cidr}"
+      ENABLE_PCAPS="${enable_pcaps}"
+      REDIS_HOST="${redis_host}"
+      REDIS_PORT="${redis_port}"
+
+      echo "Starting jambonz RTP server configuration for Hetzner (large deployment)"
+
+      USER=jambonz
+      HOME=/home/jambonz
+
+      # Wait for private network metadata (may not be available immediately at boot)
+      echo "Waiting for Hetzner private network metadata..."
+      PRIVATE_IP=""
+      for i in $(seq 1 30); do
+          METADATA_RAW=$(curl -s http://169.254.169.254/hetzner/v1/metadata/private-networks)
+          PRIVATE_IP=$(echo "$METADATA_RAW" | grep -oP '(?<=ip: )\S+' | head -1)
+          if [ -n "$PRIVATE_IP" ]; then
+              echo "Got private IP from metadata: '$PRIVATE_IP' (attempt $i/30)"
+              break
+          fi
+          echo "Private network not yet available (attempt $i/30), metadata: $METADATA_RAW"
+          sleep 2
+      done
+      if [ -z "$PRIVATE_IP" ]; then
+          echo "FATAL: Could not determine private IP after 60 seconds"
+          exit 1
+      fi
+      INSTANCE_ID=$(curl -s http://169.254.169.254/hetzner/v1/metadata/instance-id 2>/dev/null || hostname)
+      PUBLIC_IP=$(curl -s http://169.254.169.254/hetzner/v1/metadata/public-ipv4 2>/dev/null || curl -s https://api.ipify.org)
+      echo "PUBLIC_IP: '$PUBLIC_IP'"
+      echo "PRIVATE_IP: '$PRIVATE_IP'"
+      echo "INSTANCE_ID: '$INSTANCE_ID'"
+
+      sudo systemctl stop rtpengine || true
+
+      # Configure rtpengine
+      echo "Configuring rtpengine..."
+      sed -i "s/PRIVATE_IP_PLACEHOLDER/$PRIVATE_IP/g" /etc/rtpengine/rtpengine.conf || true
+      sed -i "s/PUBLIC_IP_PLACEHOLDER/$PUBLIC_IP/g" /etc/rtpengine/rtpengine.conf || true
+
+      # Write PM2 ecosystem config for RTP server
+      echo "Writing ecosystem.config.js for RTP server..."
+      cat << EOF > $HOME/apps/ecosystem.config.js
+      module.exports = {
+        apps : [
+        {
+          name: 'sbc-rtpengine-sidecar',
+          cwd: '$HOME/apps/sbc-rtpengine-sidecar',
+          script: 'app.js',
+          instance_var: 'INSTANCE_ID',
+          out_file: '$HOME/.pm2/logs/sbc-rtpengine-sidecar.log',
+          err_file: '$HOME/.pm2/logs/sbc-rtpengine-sidecar.log',
+          exec_mode: 'fork',
+          instances: 1,
+          autorestart: true,
+          watch: false,
+          max_memory_restart: '1G',
+          env: {
+            LOGLEVEL: 'info',
+            RTPENGINE_DTMF_LOG_PORT: 22223,
+            ENABLE_METRICS: 1,
+            STATS_HOST: '127.0.0.1',
+            STATS_PORT: 8125,
+            STATS_PROTOCOL: 'tcp',
+            STATS_SAMPLE_RATE: 1,
+            STATS_TELEGRAF: 1,
+            JAMBONES_REDIS_HOST: '$REDIS_HOST',
+            JAMBONES_REDIS_PORT: $REDIS_PORT
+          }
+        }
+        ]
+      };
+      EOF
+
+      # Configure telegraf to send to the monitoring server
+      echo "Configuring telegraf..."
+      sudo sed -i -e "s/influxdb:8086/$MONITORING_PRIVATE_IP:8086/g" /etc/telegraf/telegraf.conf
+      sudo systemctl restart telegraf
+
+      # Configure HEP/PCAP endpoint
+      if [[ "$ENABLE_PCAPS" == "true" ]]; then
+        echo "Enabling PCAPs"
+        sudo sed -i -e "s/--delete-delay 0/--delete-delay 0 --homer=$MONITORING_PRIVATE_IP:9060 --homer-protocol=udp --homer-id=11/g" /etc/systemd/system/rtpengine.service
+      fi
+
+      sudo systemctl daemon-reload
+      sleep 5
+      sudo systemctl restart drachtio
+      sudo systemctl restart rtpengine
+
+      # Start PM2 apps
+      echo "Starting jambonz apps..."
+      sudo -u $USER bash -c "pm2 start $HOME/apps/ecosystem.config.js"
+      sudo env PATH=$PATH:/usr/bin /usr/lib/node_modules/pm2/bin/pm2 startup systemd -u $USER --hp $HOME
+      sudo -u $USER bash -c "pm2 save"
+      sudo systemctl enable pm2-$USER.service
+
+      echo "RTP server setup complete!"
+
+runcmd:
+  - /tmp/configure-rtp.sh
+
+final_message: "Jambonz RTP Server is ready!"

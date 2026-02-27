@@ -1,20 +1,11 @@
 #cloud-config
-# Cloud-init for Jambonz SBC Server on Exoscale
+# Cloud-init for Jambonz SBC Server on Hetzner Cloud
 
 # Merge SSH keys into existing jambonz user
 users:
   - name: jambonz
     ssh_authorized_keys:
       - "${ssh_public_key}"
-
-# Configure network interfaces (both public and private)
-network:
-  version: 2
-  ethernets:
-    eth0:
-      dhcp4: true
-    eth1:
-      dhcp4: true
 
 write_files:
   - path: /tmp/configure-sbc.sh
@@ -38,31 +29,38 @@ write_files:
       WEB_MONITORING_PRIVATE_IP="${web_monitoring_private_ip}"
       ENABLE_PCAPS="${enable_pcaps}"
 
-      echo "Starting jambonz SBC-$SBC_INDEX server configuration for Exoscale"
+      echo "Starting jambonz SBC-$SBC_INDEX server configuration for Hetzner"
 
       USER=jambonz
       HOME=/home/jambonz
 
-      # Get instance metadata
-      echo "Getting instance metadata..."
-      # Get private IP from eth1 (private network interface)
-      PRIVATE_IP=$(ip -4 addr show eth1 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' || echo "172.20.0.1")
-      INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || hostname)
-      PUBLIC_IP=$(curl -s https://api.ipify.org)
-
-      echo "Public IP: $PUBLIC_IP"
-      echo "Private IP: $PRIVATE_IP (eth1)"
-      echo "Instance ID: $INSTANCE_ID"
-
-      # Wait for Redis to be ready
-      echo "Waiting for Redis at $REDIS_HOST:$REDIS_PORT..."
-      for i in $(seq 1 60); do
-          if redis-cli -h $REDIS_HOST -p $REDIS_PORT ping 2>/dev/null | grep -q PONG; then
-              echo "Redis is available"
+      # Wait for private network metadata (may not be available immediately at boot)
+      echo "Waiting for Hetzner private network metadata..."
+      PRIVATE_IP=""
+      for i in $(seq 1 30); do
+          METADATA_RAW=$(curl -s http://169.254.169.254/hetzner/v1/metadata/private-networks)
+          PRIVATE_IP=$(echo "$METADATA_RAW" | grep -oP '(?<=ip: )\S+' | head -1)
+          if [ -n "$PRIVATE_IP" ]; then
+              echo "Got private IP from metadata: '$PRIVATE_IP' (attempt $i/30)"
               break
           fi
-          echo "Redis not yet available, attempt $i/60..."
-          sleep 10
+          echo "Private network not yet available (attempt $i/30), metadata: $METADATA_RAW"
+          sleep 2
+      done
+      if [ -z "$PRIVATE_IP" ]; then
+          echo "FATAL: Could not determine private IP after 60 seconds"
+          exit 1
+      fi
+      INSTANCE_ID=$(curl -s http://169.254.169.254/hetzner/v1/metadata/instance-id 2>/dev/null || hostname)
+      PUBLIC_IP=$(curl -s http://169.254.169.254/hetzner/v1/metadata/public-ipv4 2>/dev/null || curl -s https://api.ipify.org)
+      echo "PUBLIC_IP: '$PUBLIC_IP'"
+      echo "INSTANCE_ID: '$INSTANCE_ID'"
+
+      # Wait for Redis to be ready
+      echo "Waiting for Redis to be ready..."
+      until redis-cli -h $REDIS_HOST -p $REDIS_PORT PING &>/dev/null; do
+        echo "Redis not ready, waiting..."
+        sleep 5
       done
 
       sudo systemctl stop rtpengine || true
@@ -83,7 +81,8 @@ write_files:
       sed -i "s/PRIVATE_IP_PLACEHOLDER/$PRIVATE_IP/g" /etc/rtpengine/rtpengine.conf || true
       sed -i "s/PUBLIC_IP_PLACEHOLDER/$PUBLIC_IP/g" /etc/rtpengine/rtpengine.conf || true
 
-      echo "Writing $HOME/apps/ecosystem.config.js..."
+      # Write PM2 ecosystem config for SBC
+      echo "Writing ecosystem.config.js for SBC..."
       cat << EOF > $HOME/apps/ecosystem.config.js
       module.exports = {
         apps : [
@@ -114,7 +113,6 @@ write_files:
             JAMBONES_MYSQL_CONNECTION_LIMIT: 10,
             JAMBONES_REDIS_HOST: '$REDIS_HOST',
             JAMBONES_REDIS_PORT: $REDIS_PORT,
-
             JAMBONES_TIME_SERIES_HOST: '$WEB_MONITORING_PRIVATE_IP',
             ENABLE_METRICS: 1,
             STATS_HOST: '127.0.0.1',
@@ -208,7 +206,6 @@ write_files:
             JAMBONES_MYSQL_CONNECTION_LIMIT: 10,
             JAMBONES_REDIS_HOST: '$REDIS_HOST',
             JAMBONES_REDIS_PORT: $REDIS_PORT,
-
             JAMBONES_TIME_SERIES_HOST: '$WEB_MONITORING_PRIVATE_IP',
             JAMBONES_TRACK_ACCOUNT_CALLS: 0,
             JAMBONES_TRACK_SP_CALLS: 0,
@@ -253,7 +250,6 @@ write_files:
             JAMBONES_MYSQL_CONNECTION_LIMIT: 10,
             JAMBONES_REDIS_HOST: '$REDIS_HOST',
             JAMBONES_REDIS_PORT: $REDIS_PORT,
-
             JAMBONES_TIME_SERIES_HOST: '$WEB_MONITORING_PRIVATE_IP',
             ENABLE_METRICS: 1,
             JAMBONES_TRACK_ACCOUNT_CALLS: 0,
@@ -270,7 +266,6 @@ write_files:
         ]
       };
       EOF
-      echo "Finished writing config file"
 
       # Configure telegraf to send to the monitoring server
       echo "Configuring telegraf..."
@@ -288,8 +283,9 @@ write_files:
       sudo sed -i "s/--homer 127.0.0.1:9060/--homer $WEB_MONITORING_PRIVATE_IP:9060/g" /etc/systemd/system/drachtio.service
 
       sudo systemctl daemon-reload
-      sudo systemctl restart rtpengine
+      sleep 5
       sudo systemctl restart drachtio
+      sudo systemctl restart rtpengine
 
       # Start PM2 apps
       echo "Starting jambonz apps..."
@@ -298,9 +294,7 @@ write_files:
       sudo -u $USER bash -c "pm2 save"
       sudo systemctl enable pm2-$USER.service
 
-      # Configure APIBan - supports two modes:
-      # 1. Client credentials mode: auto-provision unique key per instance (preferred)
-      # 2. Single key mode: use customer-provided key
+      # Configure APIBan
       APIBAN_KEY="${apiban_key}"
       APIBAN_CLIENT_ID="${apiban_client_id}"
       APIBAN_CLIENT_SECRET="${apiban_client_secret}"
@@ -327,6 +321,6 @@ write_files:
       echo "SBC-$SBC_INDEX server configuration complete!"
 
 runcmd:
-  - /tmp/configure-sbc.sh > /var/log/jambonz-setup.log 2>&1
+  - /tmp/configure-sbc.sh
 
-final_message: "jambonz SBC cloud-init configuration complete after $UPTIME seconds"
+final_message: "Jambonz SBC server is ready!"

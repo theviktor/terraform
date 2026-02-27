@@ -1,21 +1,11 @@
 #cloud-config
-# Cloud-init for Jambonz Web/Monitoring Server on Exoscale
+# Cloud-init for Jambonz Web/Monitoring Server on Hetzner Cloud
 
 # Merge SSH keys into existing jambonz user
-# Note: jambonz user already exists in the template, we're just adding SSH keys
 users:
   - name: jambonz
     ssh_authorized_keys:
       - "${ssh_public_key}"
-
-# Configure network interfaces (both public and private)
-network:
-  version: 2
-  ethernets:
-    eth0:
-      dhcp4: true
-    eth1:
-      dhcp4: true
 
 write_files:
   - path: /tmp/configure-jambonz.sh
@@ -36,49 +26,110 @@ write_files:
       URL_PORTAL="${url_portal}"
       VPC_CIDR="${vpc_cidr}"
       DEPLOY_RECORDING_CLUSTER="${deploy_recording_cluster}"
+      ENABLE_OTEL="${enable_otel}"
+      ENABLE_PCAPS="${enable_pcaps}"
+      DATA_VOLUME_DEVICE="${data_volume_device}"
 
-      echo "Starting jambonz Web/Monitoring server configuration for Exoscale"
+      echo "Starting jambonz Web/Monitoring server configuration for Hetzner"
 
-      # Always use jambonz user for apps
       USER=jambonz
       HOME=/home/jambonz
+      NGINX_CONFIG=/etc/nginx/sites-available/default
 
-      # Get instance metadata from Exoscale Metadata Service
-      echo "Getting instance metadata..."
-      # Get private IP from eth1 (private network interface)
-      PRIVATE_IP=$(ip -4 addr show eth1 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' || echo "172.20.0.1")
-      INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || hostname)
-      PUBLIC_IP=$(curl -s https://api.ipify.org)
+      # Mount data volume at /var/lib for persistent storage
+      # Hetzner automount puts it at /mnt/HC_Volume_*, but we want /var/lib
+      if [ -n "$DATA_VOLUME_DEVICE" ] && [ -b "$DATA_VOLUME_DEVICE" ]; then
+        echo "Mounting data volume $DATA_VOLUME_DEVICE at /var/lib..."
 
-      echo "Public IP: $PUBLIC_IP"
-      echo "Private IP: $PRIVATE_IP (eth1)"
-      echo "Instance ID: $INSTANCE_ID"
+        # Unmount if Hetzner automounted it somewhere else
+        if mount | grep -q "$DATA_VOLUME_DEVICE"; then
+          AUTOMOUNT_PATH=$(mount | grep "$DATA_VOLUME_DEVICE" | awk '{print $3}')
+          echo "Volume already mounted at $AUTOMOUNT_PATH, unmounting..."
+          umount "$AUTOMOUNT_PATH"
+          # Remove automount fstab entry if present
+          sed -i "\|$DATA_VOLUME_DEVICE|d" /etc/fstab
+        fi
 
-      # Wait for database to be ready
+        # Stop services that write to /var/lib
+        echo "Stopping services before /var/lib migration..."
+        systemctl stop influxdb 2>/dev/null || true
+        systemctl stop postgresql 2>/dev/null || true
+        systemctl stop postgresql-12 2>/dev/null || true
+        systemctl stop grafana-server 2>/dev/null || true
+        systemctl stop redis-server 2>/dev/null || true
+        systemctl stop redis 2>/dev/null || true
+        systemctl stop telegraf 2>/dev/null || true
+        systemctl stop cassandra 2>/dev/null || true
+
+        # Mount volume temporarily and copy existing /var/lib contents
+        TEMP_MOUNT=/mnt/data-volume
+        mkdir -p $TEMP_MOUNT
+        mount -o discard,defaults $DATA_VOLUME_DEVICE $TEMP_MOUNT
+
+        # Only copy if volume is empty (first boot)
+        if [ ! -f "$TEMP_MOUNT/.migrated" ]; then
+          echo "First boot: copying /var/lib to data volume..."
+          rsync -a /var/lib/ $TEMP_MOUNT/
+          touch $TEMP_MOUNT/.migrated
+        fi
+
+        umount $TEMP_MOUNT
+        rmdir $TEMP_MOUNT
+
+        # Mount the volume at /var/lib
+        mount -o discard,defaults $DATA_VOLUME_DEVICE /var/lib
+
+        # Add fstab entry for persistence across reboots
+        echo "$DATA_VOLUME_DEVICE /var/lib ext4 discard,defaults,nofail 0 2" >> /etc/fstab
+
+        echo "Data volume mounted at /var/lib"
+
+        # Restart services that were stopped
+        systemctl start redis-server 2>/dev/null || systemctl start redis 2>/dev/null || true
+        systemctl start postgresql 2>/dev/null || systemctl start postgresql-12 2>/dev/null || true
+        systemctl start influxdb 2>/dev/null || true
+        systemctl start grafana-server 2>/dev/null || true
+        systemctl start telegraf 2>/dev/null || true
+      else
+        echo "No data volume device found ($DATA_VOLUME_DEVICE), using root disk for /var/lib"
+      fi
+
+      # Wait for private network metadata (may not be available immediately at boot)
+      echo "Waiting for Hetzner private network metadata..."
+      PRIVATE_IP=""
+      for i in $(seq 1 30); do
+          METADATA_RAW=$(curl -s http://169.254.169.254/hetzner/v1/metadata/private-networks)
+          PRIVATE_IP=$(echo "$METADATA_RAW" | grep -oP '(?<=ip: )\S+' | head -1)
+          if [ -n "$PRIVATE_IP" ]; then
+              echo "Got private IP from metadata: '$PRIVATE_IP' (attempt $i/30)"
+              break
+          fi
+          echo "Private network not yet available (attempt $i/30), metadata: $METADATA_RAW"
+          sleep 2
+      done
+      if [ -z "$PRIVATE_IP" ]; then
+          echo "FATAL: Could not determine private IP after 60 seconds"
+          exit 1
+      fi
+      INSTANCE_ID=$(curl -s http://169.254.169.254/hetzner/v1/metadata/instance-id 2>/dev/null || hostname)
+      PUBLIC_IP=$(curl -s http://169.254.169.254/hetzner/v1/metadata/public-ipv4 2>/dev/null || curl -s https://api.ipify.org)
+      echo "PUBLIC_IP: '$PUBLIC_IP'"
+      echo "INSTANCE_ID: '$INSTANCE_ID'"
+
+      # Wait for database to be ready (MySQL on dedicated DB VM)
       echo "Waiting for MySQL to be ready..."
       MYSQL_OPTS="-h $MYSQL_HOST --port=$MYSQL_PORT -u $MYSQL_USER -D $MYSQL_DATABASE -p$MYSQL_PASSWORD"
-      until mysql -h $MYSQL_HOST --port=$MYSQL_PORT -u $MYSQL_USER -p$MYSQL_PASSWORD -e "SELECT 1" &>/dev/null; do
+      until mysql $MYSQL_OPTS -e "SELECT 1" &>/dev/null; do
         echo "MySQL not ready, waiting..."
         sleep 5
       done
 
-      echo "Seeding database..."
-      DEFAULT_ACCOUNT_SID=$(uuidgen)
-      DEFAULT_TOKEN=$(uuidgen)
+      # Database schema and seed data are pre-loaded in the DB snapshot.
+      # Update the public-apps URL to use the correct domain
+      echo "Updating database with deployment-specific values..."
+      mysql $MYSQL_OPTS -e "UPDATE service_providers SET root_domain = '$URL_PORTAL' WHERE root_domain = 'jambonz.cloud' OR root_domain IS NOT NULL" || true
 
-      # Exoscale DBaaS MySQL requires primary keys on all tables and uses
-      # ANSI_QUOTES SQL mode (double quotes = identifiers). Fix both for import.
-      SQL_PREAMBLE="SET SESSION sql_require_primary_key = 0; SET SESSION sql_mode = 'NO_ENGINE_SUBSTITUTION';"
-
-      # Seed database
-      cd $HOME/apps/api-server/db
-      sudo sed -i "s/9351f46a-678c-43f5-b8a6-d4eb58d131af/$DEFAULT_ACCOUNT_SID/g" seed-production-database-open-source.sql
-      sudo sed -i "s/38700987-c7a4-4685-a5bb-af378f9734de/$DEFAULT_TOKEN/g" seed-production-database-open-source.sql
-      echo "$SQL_PREAMBLE" | cat - jambones-sql.sql | mysql $MYSQL_OPTS || true
-      sudo sed -i "s/public-apps.jambonz.cloud/public-apps.$URL_PORTAL/g" seed-production-database-open-source.sql
-      echo "$SQL_PREAMBLE" | cat - seed-production-database-open-source.sql | mysql $MYSQL_OPTS || true
-
-      # Reset admin password
+      # Reset admin password to instance ID
       JAMBONES_ADMIN_INITIAL_PASSWORD=$INSTANCE_ID \
       JAMBONES_MYSQL_HOST=$MYSQL_HOST \
       JAMBONES_MYSQL_PORT=$MYSQL_PORT \
@@ -97,7 +148,6 @@ write_files:
       TAG="<script>window.JAMBONZ = { API_BASE_URL: '$API_BASE_URL'};</script>"
       sed -i -e "\@</head>@i\ $TAG" $HOME/apps/webapp/dist/index.html || true
 
-      # Write PM2 ecosystem config
       echo "Writing $HOME/apps/ecosystem.config.js..."
       cat << EOF > $HOME/apps/ecosystem.config.js
       module.exports = {
@@ -120,10 +170,9 @@ write_files:
             JWT_SECRET: '$JWT_SECRET',
             AUTHENTICATION_KEY: '$JWT_SECRET',
             JAMBONES_MYSQL_HOST: '$MYSQL_HOST',
-            JAMBONES_MYSQL_PORT: $MYSQL_PORT,
             JAMBONES_MYSQL_USER: '$MYSQL_USER',
             JAMBONES_MYSQL_PASSWORD: '$MYSQL_PASSWORD',
-            JAMBONES_MYSQL_DATABASE: '$MYSQL_DATABASE',
+            JAMBONES_MYSQL_DATABASE: 'jambones',
             JAMBONES_MYSQL_CONNECTION_LIMIT: 10,
             JAMBONES_REDIS_HOST: '$REDIS_HOST',
             JAMBONES_REDIS_PORT: $REDIS_PORT,
@@ -184,7 +233,7 @@ write_files:
       sudo systemctl restart telegraf
 
       # Configure nginx
-      sudo tee /etc/nginx/sites-available/default > /dev/null << EOFNGINX
+      sudo tee $NGINX_CONFIG > /dev/null << EOFNGINX
       server {
           listen 80;
           server_name $URL_PORTAL;
@@ -246,21 +295,37 @@ write_files:
 
       sudo systemctl restart nginx
 
-      sudo systemctl restart heplify-server.service || true
+      # HEPlify server (receives HEP packets from SBC servers)
+      if [[ "$ENABLE_PCAPS" == "true" ]]; then
+        sudo systemctl restart heplify-server.service || true
+      else
+        sudo systemctl stop heplify-server.service || true
+        sudo systemctl disable heplify-server.service || true
+      fi
 
-      # Restart cassandra and give it time to come up
-      echo "Restarting cassandra..."
-      sudo systemctl restart cassandra.service || true
-      sleep 60
-      echo "Restarting jaeger"
-      sudo systemctl restart jaeger-collector.service || true
-      sudo systemctl restart jaeger-query.service || true
+      # OTEL tracing (Cassandra + Jaeger)
+      if [[ "$ENABLE_OTEL" == "true" ]]; then
+        echo "Restarting cassandra..."
+        sudo systemctl restart cassandra.service || true
+        sleep 60
+        echo "Restarting jaeger"
+        sudo systemctl restart jaeger-collector.service || true
+        sudo systemctl restart jaeger-query.service || true
+      else
+        echo "OTEL tracing disabled — stopping cassandra and jaeger..."
+        sudo systemctl stop cassandra.service || true
+        sudo systemctl stop jaeger-collector.service || true
+        sudo systemctl stop jaeger-query.service || true
+        sudo systemctl disable cassandra.service || true
+        sudo systemctl disable jaeger-collector.service || true
+        sudo systemctl disable jaeger-query.service || true
+      fi
 
       # Configure upload_recordings service
       sudo sed -i -e "s/MYSQL_HOST=/MYSQL_HOST=$MYSQL_HOST/g" /etc/systemd/system/upload_recordings.service
       sudo sed -i -e "s/MYSQL_USER=/MYSQL_USER=$MYSQL_USER/g" /etc/systemd/system/upload_recordings.service
       sudo sed -i -e "s/MYSQL_PASSWORD=/MYSQL_PASSWORD=$MYSQL_PASSWORD/g" /etc/systemd/system/upload_recordings.service
-      sudo sed -i -e "s/MYSQL_DATABASE=/MYSQL_DATABASE=$MYSQL_DATABASE/g" /etc/systemd/system/upload_recordings.service
+      sudo sed -i -e "s/MYSQL_DATABASE=/MYSQL_DATABASE=jambones/g" /etc/systemd/system/upload_recordings.service
       sudo sed -i -e "s/BASIC_AUTH_USERNAME=/BASIC_AUTH_USERNAME=jambonz/g" /etc/systemd/system/upload_recordings.service
       sudo sed -i -e "s/BASIC_AUTH_PASSWORD=/BASIC_AUTH_PASSWORD=$JWT_SECRET/g" /etc/systemd/system/upload_recordings.service
       sudo sed -i -e "s/ENCRYPTION_SECRET=/ENCRYPTION_SECRET=$JWT_SECRET/g" /etc/systemd/system/upload_recordings.service
@@ -279,6 +344,6 @@ write_files:
       echo "Web + monitoring server setup complete!"
 
 runcmd:
-  - /tmp/configure-jambonz.sh > /var/log/jambonz-setup.log 2>&1
+  - /tmp/configure-jambonz.sh
 
-final_message: "jambonz Web/Monitoring cloud-init configuration complete after $UPTIME seconds"
+final_message: "Jambonz Web/Monitoring server is ready!"

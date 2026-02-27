@@ -1,0 +1,117 @@
+# =============================================================================
+# Jambonz Mini (All-in-One) on Hetzner Cloud - Example Configuration
+# =============================================================================
+# Copy this file to terraform.tfvars and customize for your deployment
+
+# =============================================================================
+# HETZNER CLOUD AUTHENTICATION (choose one method)
+# =============================================================================
+#
+# Method 1: Provide token directly (add to this file or pass via -var)
+# hcloud_token = "your-api-token"
+#
+# Method 2: Set environment variable (recommended — keeps token out of files)
+# export HCLOUD_TOKEN="your-api-token"
+#
+# Generate a token in the Hetzner Cloud Console:
+#   Project → Security → API Tokens → Generate API Token (Read & Write)
+
+# =============================================================================
+# REQUIRED VARIABLES
+# =============================================================================
+
+# Resource naming prefix (used for all resource names)
+name_prefix = "jambonz-mini"
+
+# Hetzner Cloud location for deployment
+# Options: nbg1 (Nuremberg), fsn1 (Falkenstein), hel1 (Helsinki),
+#          ash (Ashburn VA), hil (Hillsboro OR), sgp1 (Singapore)
+location = "nbg1"
+
+# Domain name for the portal (DNS A records will need to be created)
+url_portal = "jambonz.example.com"
+
+# =============================================================================
+# SSH KEY CONFIGURATION (choose one method)
+# =============================================================================
+
+# Method 1: Provide your SSH public key directly
+ssh_public_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC... your-email@example.com"
+
+# Method 2: Use an existing Hetzner SSH key name (comment out ssh_public_key above)
+# ssh_key_name = "my-hetzner-key"
+
+# =============================================================================
+# JAMBONZ SNAPSHOT ID
+# =============================================================================
+# Build the jambonz mini snapshot with Packer, then provide its ID here.
+
+image_mini = "0"   # jambonz-mini snapshot ID
+
+# =============================================================================
+# SERVER TYPE
+# =============================================================================
+# Default: cx33 (4 vCPU, 8 GB RAM, 80 GB disk)
+# Not all server types are available in all locations.
+# To list available types: hcloud server-type list
+
+#server_type = "cx33"
+
+# =============================================================================
+# SECURITY CONFIGURATION
+# =============================================================================
+
+# CIDR blocks for access control (use 0.0.0.0/0 for open access)
+# IMPORTANT: Restrict these to your IP ranges for production!
+
+allowed_ssh_cidr  = "0.0.0.0/0"  # SSH access
+allowed_sip_cidr  = "0.0.0.0/0"  # SIP/RTP traffic
+allowed_http_cidr = "0.0.0.0/0"  # HTTP/HTTPS (portal, Grafana, Homer)
+
+# For production, use specific IP ranges:
+# allowed_ssh_cidr  = "203.0.113.0/24"    # Your office IP range
+# allowed_sip_cidr  = "198.51.100.0/24"   # Your SIP provider IP range
+# allowed_http_cidr = "203.0.113.0/24"    # Your office/VPN IP range
+
+# =============================================================================
+# OPTIONAL FEATURES
+# =============================================================================
+
+# APiBan API key for fraud/spam IP blocking (optional)
+# Get a free key from https://apiban.org
+# apiban_key = "your-apiban-api-key"
+
+# PCAP capture via Homer HEP endpoint (default: enabled)
+# Set to "false" to disable SIP/RTP packet capture
+# enable_pcaps = "false"
+
+# OpenTelemetry tracing with Cassandra + Jaeger (default: enabled)
+# Set to "false" to disable and save resources
+# enable_otel = "false"
+
+# =============================================================================
+# NOTES
+# =============================================================================
+#
+# 1. DNS CONFIGURATION:
+#    After deployment, create DNS A records pointing to the server IP:
+#    - jambonz.example.com → Server IP
+#    - api.jambonz.example.com → Server IP
+#    - grafana.jambonz.example.com → Server IP
+#    - homer.jambonz.example.com → Server IP
+#    - sip.jambonz.example.com → Server IP
+#
+#    Or use the automated post-install script:
+#      python ../../post_install.py --email admin@example.com
+#
+# 2. ARCHITECTURE:
+#    Mini is a single all-in-one VM running all jambonz services:
+#    - SBC (drachtio + rtpengine)
+#    - Feature server (FreeSWITCH)
+#    - Web portal + API server
+#    - Monitoring (Grafana, Homer, InfluxDB, Telegraf)
+#    - Database (MySQL + Redis)
+#    - Optional: Jaeger tracing (Cassandra-backed)
+#
+# 3. SSH ACCESS:
+#    ssh jambonz@<server-ip>

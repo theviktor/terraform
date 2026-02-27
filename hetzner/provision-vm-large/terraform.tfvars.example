@@ -1,0 +1,178 @@
+# =============================================================================
+# Jambonz Large Cluster on Hetzner Cloud - Example Configuration
+# =============================================================================
+# Copy this file to terraform.tfvars and customize for your deployment
+
+# =============================================================================
+# HETZNER CLOUD AUTHENTICATION (choose one method)
+# =============================================================================
+#
+# Method 1: Provide token directly (add to this file or pass via -var)
+# hcloud_token = "your-api-token"
+#
+# Method 2: Set environment variable (recommended — keeps token out of files)
+# export HCLOUD_TOKEN="your-api-token"
+#
+# Generate a token in the Hetzner Cloud Console:
+#   Project → Security → API Tokens → Generate API Token (Read & Write)
+
+# =============================================================================
+# REQUIRED VARIABLES
+# =============================================================================
+
+# Resource naming prefix (used for all resource names)
+name_prefix = "jambonz-large"
+
+# Hetzner Cloud location for deployment
+# Options: nbg1 (Nuremberg), fsn1 (Falkenstein), hel1 (Helsinki),
+#          ash (Ashburn VA), hil (Hillsboro OR), sgp1 (Singapore)
+location = "nbg1"
+
+# Domain name for the portal (DNS A records will need to be created)
+url_portal = "jambonz.example.com"
+
+# =============================================================================
+# SSH KEY CONFIGURATION (choose one method)
+# =============================================================================
+
+# Method 1: Provide your SSH public key directly
+ssh_public_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC... your-email@example.com"
+
+# Method 2: Use an existing Hetzner SSH key name (comment out ssh_public_key above)
+# ssh_key_name = "my-hetzner-key"
+
+# =============================================================================
+# JAMBONZ SNAPSHOT IDS
+# =============================================================================
+# Build jambonz snapshots with Packer, then provide their IDs here.
+
+image_web            = "0"   # jambonz-web snapshot ID
+image_monitoring     = "0"   # jambonz-monitoring snapshot ID
+image_sip            = "0"   # jambonz-sip snapshot ID
+image_rtp            = "0"   # jambonz-rtp snapshot ID
+image_feature_server = "0"   # jambonz-fs snapshot ID
+image_db             = "0"   # jambonz-db snapshot ID (MySQL pre-installed)
+image_recording      = "0"   # jambonz-recording snapshot ID (if using recording)
+
+# =============================================================================
+# INSTANCE COUNTS
+# =============================================================================
+
+sip_count                = 1
+rtp_count                = 1
+feature_server_count     = 1
+recording_server_count   = 1
+deploy_recording_cluster = true
+
+# =============================================================================
+# SERVER TYPES
+# =============================================================================
+# NOTE: Not all server types are available in all locations.
+# To list available types: hcloud server-type list
+
+server_type_web        = "cx33"   # 4 vCPU, 8 GB RAM
+server_type_monitoring = "cx33"   # 4 vCPU, 8 GB RAM
+server_type_db         = "cx33"   # 4 vCPU, 8 GB RAM
+server_type_sip        = "cx33"   # 4 vCPU, 8 GB RAM
+server_type_rtp        = "cx33"   # 4 vCPU, 8 GB RAM
+server_type_feature    = "cx33"   # 4 vCPU, 8 GB RAM
+server_type_recording  = "cx33"   # 4 vCPU, 8 GB RAM
+
+# =============================================================================
+# VOLUME SIZES
+# =============================================================================
+# Additional storage for the monitoring server (added to built-in 80 GB disk)
+
+volume_size_monitoring = 120  # 80 + 120 = 200 GB total
+
+# =============================================================================
+# NETWORK CONFIGURATION
+# =============================================================================
+
+# Private network CIDR (default: 172.20.0.0/16)
+vpc_cidr = "172.20.0.0/16"
+
+# =============================================================================
+# SECURITY CONFIGURATION
+# =============================================================================
+
+# CIDR blocks for access control (use 0.0.0.0/0 for open access)
+# IMPORTANT: Restrict these to your IP ranges for production!
+
+allowed_ssh_cidr  = "0.0.0.0/0"  # SSH access to all servers
+allowed_sip_cidr  = "0.0.0.0/0"  # SIP/RTP traffic to SIP/RTP servers
+allowed_http_cidr = "0.0.0.0/0"  # HTTP/HTTPS to web/monitoring
+
+# For production, use specific IP ranges:
+# allowed_ssh_cidr  = "203.0.113.0/24"    # Your office IP range
+# allowed_sip_cidr  = "198.51.100.0/24"   # Your SIP provider IP range
+# allowed_http_cidr = "203.0.113.0/24"    # Your office/VPN IP range
+
+# =============================================================================
+# DATABASE CREDENTIALS
+# =============================================================================
+
+# MySQL username (default: admin)
+mysql_username = "admin"
+
+# MySQL password (leave empty for auto-generation - recommended)
+# mysql_password = ""  # Auto-generated if not provided
+
+# =============================================================================
+# OPTIONAL FEATURES
+# =============================================================================
+
+# APiBan for fraud/spam IP blocking (optional)
+# Get a free key from https://apiban.org
+# apiban_key = "your-apiban-api-key"
+
+# Or use multi-key mode with client ID and secret
+# apiban_client_id     = "your-client-id"
+# apiban_client_secret = "your-client-secret"
+
+# PCAP capture via Homer HEP endpoint on SIP/RTP servers (default: enabled)
+# Set to "false" to disable SIP/RTP packet capture
+# enable_pcaps = "false"
+
+# OpenTelemetry tracing with Cassandra + Jaeger on monitoring server (default: enabled)
+# Set to "false" to disable and save resources
+# enable_otel = "false"
+
+# =============================================================================
+# NOTES
+# =============================================================================
+#
+# 1. DNS CONFIGURATION:
+#    After deployment, create DNS A records pointing to the outputted IPs:
+#    - jambonz.example.com → Web server IP
+#    - api.jambonz.example.com → Web server IP
+#    - grafana.jambonz.example.com → Web server IP
+#    - homer.jambonz.example.com → Web server IP
+#    - sip.jambonz.example.com → First SIP server IP
+#
+# 2. ARCHITECTURE (Large splits SBC into separate SIP + RTP servers):
+#    - Web: Portal, API, webapp
+#    - Monitoring: Grafana, Homer, InfluxDB, Cassandra, Jaeger (separate VM)
+#    - SIP: drachtio, sbc-inbound/outbound/call-router (no rtpengine)
+#    - RTP: rtpengine, sbc-rtpengine-sidecar (no drachtio)
+#    - Feature Server: FreeSWITCH, jambonz apps
+#    - DB: MySQL + Redis on a dedicated VM
+#    - All inter-server communication flows over the private network
+#
+# 3. SSH ACCESS:
+#    - Web, Monitoring, SIP, and RTP servers have public IPs (direct SSH)
+#    - DB, Feature, and Recording servers are firewalled to SSH-only on public
+#    - Use SIP as a jump/bastion server to access private servers:
+#      ssh -J jambonz@<sip-ip> jambonz@<feature-server-private-ip>
+#      ssh -J jambonz@<sip-ip> jambonz@<db-private-ip>
+#
+# 4. SERVER TYPES:
+#    Not all server types are available in all locations. Hetzner periodically
+#    retires older plan names and introduces new ones. To list available types:
+#      hcloud server-type list
+#    Common x86 shared types: cx23, cx33, cx43, cx53, cpx22, cpx32, cpx42
+#    ARM types (select locations): cax11, cax21, cax31, cax41
+#
+# 5. SCALING:
+#    You can scale SIP (1-10), RTP (1-10), Feature (1-10), and Recording (1-10)
+#    servers by updating the counts in this file and running terraform apply.

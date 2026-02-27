@@ -1,0 +1,255 @@
+#cloud-config
+# Cloud-init for Jambonz Mini (All-in-One) on Hetzner Cloud
+
+# Merge SSH keys into existing jambonz user
+users:
+  - name: jambonz
+    ssh_authorized_keys:
+      - "${ssh_public_key}"
+
+write_files:
+  - path: /tmp/configure-jambonz.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash -xe
+      # Configuration script for jambonz Mini (all-in-one) server
+
+      # Variables from Terraform
+      URL_PORTAL="${url_portal}"
+      JWT_SECRET="${jwt_secret}"
+      NEW_DB_PASSWD="${db_password}"
+      ENABLE_OTEL="${enable_otel}"
+      ENABLE_PCAPS="${enable_pcaps}"
+
+      echo "Starting jambonz Mini configuration for Hetzner"
+
+      USER=jambonz
+      HOME=/home/jambonz
+      NGINX_CONFIG=/etc/nginx/sites-available/default
+
+      # Get instance metadata
+      PUBLIC_IP=$(curl -s http://169.254.169.254/hetzner/v1/metadata/public-ipv4 2>/dev/null || curl -s https://api.ipify.org)
+      INSTANCE_ID=$(curl -s http://169.254.169.254/hetzner/v1/metadata/instance-id 2>/dev/null || hostname)
+      echo "PUBLIC_IP: '$PUBLIC_IP'"
+      echo "INSTANCE_ID: '$INSTANCE_ID'"
+
+      # Ensure MySQL is running
+      sudo systemctl start mysql 2>/dev/null || sudo systemctl start mysqld 2>/dev/null || true
+
+      # Ensure jambones database and admin user exist
+      # The snapshot should have these pre-seeded, but fall back to initialization if not
+      if ! mysql -h 127.0.0.1 -u admin -pJambonzR0ck$ -e "SELECT 1" &>/dev/null; then
+          echo "Default admin user not found, initializing MySQL..."
+          MYSQL_ROOT_CMD="mysql -h 127.0.0.1 -u root"
+          TEMP_PASSWD=$(grep 'temporary password' /var/log/mysqld.log 2>/dev/null | tail -1 | awk '{print $NF}')
+          if [ -n "$TEMP_PASSWD" ]; then
+              MYSQL_ROOT_CMD="mysql -h 127.0.0.1 -u root -p$TEMP_PASSWD --connect-expired-password"
+          fi
+          $MYSQL_ROOT_CMD -e "CREATE DATABASE IF NOT EXISTS jambones" || true
+          $MYSQL_ROOT_CMD -e "CREATE USER IF NOT EXISTS 'admin'@'%' IDENTIFIED BY 'JambonzR0ck\$'" || true
+          $MYSQL_ROOT_CMD -e "GRANT ALL PRIVILEGES ON jambones.* TO 'admin'@'%'" || true
+          $MYSQL_ROOT_CMD -e "FLUSH PRIVILEGES" || true
+
+          if [ -f "$HOME/apps/api-server/db/jambones-sql.sql" ]; then
+              echo "Seeding jambones database schema..."
+              mysql -h 127.0.0.1 -u admin -pJambonzR0ck$ -D jambones < $HOME/apps/api-server/db/jambones-sql.sql || true
+              mysql -h 127.0.0.1 -u admin -pJambonzR0ck$ -D jambones < $HOME/apps/api-server/db/seed-production-database-open-source.sql || true
+          fi
+      fi
+
+      # Change the database password from default to terraform-generated
+      echo "alter user 'admin'@'%' identified by '$NEW_DB_PASSWD'" | mysql -h 127.0.0.1 -u admin -D jambones -pJambonzR0ck$ || true
+
+      # Update ecosystem.config.js with new password and IPs
+      if [ -f "$HOME/apps/ecosystem.config.js" ]; then
+          sudo sed -i -e "s/\(.*\)JAMBONES_MYSQL_PASSWORD.*/\1JAMBONES_MYSQL_PASSWORD: '$NEW_DB_PASSWD',/g" $HOME/apps/ecosystem.config.js
+          sudo sed -i -e "s/\(.*\)PRIVATE_IP\(.*\)/\1$PUBLIC_IP\2/g" $HOME/apps/ecosystem.config.js
+          sudo sed -i -e "s/\(.*\)--JAMBONES_API_BASE_URL--\(.*\)/\1http:\/\/$PUBLIC_IP\/v1\2/g" $HOME/apps/ecosystem.config.js
+          sudo sed -i -e "s/\(.*\)JWT-SECRET-GOES_HERE\(.*\)/\1$JWT_SECRET\2/g" $HOME/apps/ecosystem.config.js
+      fi
+
+      # Reset admin portal password to instance ID
+      if [ -f "$HOME/apps/api-server/db/reset_admin_password.js" ]; then
+          JAMBONES_ADMIN_INITIAL_PASSWORD=$INSTANCE_ID \
+          JAMBONES_MYSQL_USER=admin \
+          JAMBONES_MYSQL_PASSWORD=$NEW_DB_PASSWD \
+          JAMBONES_MYSQL_DATABASE=jambones \
+          JAMBONES_MYSQL_HOST=127.0.0.1 \
+          $HOME/apps/api-server/db/reset_admin_password.js || true
+      fi
+
+      # Configure webapp with DNS name
+      if [ -d "$HOME/apps/webapp" ]; then
+          echo "VITE_API_BASE_URL=http://$URL_PORTAL/api/v1" > "$HOME/apps/webapp/.env"
+          API_BASE_URL="http://$URL_PORTAL/api/v1"
+          TAG="<script>window.JAMBONZ = { API_BASE_URL: '$API_BASE_URL'};</script>"
+          sed -i -e "\@</head>@i\ $TAG" $HOME/apps/webapp/dist/index.html || true
+      fi
+
+      # Add system information
+      mysql -h 127.0.0.1 -u admin -D jambones -p$NEW_DB_PASSWD -e "INSERT INTO system_information (domain_name, sip_domain_name, monitoring_domain_name) VALUES ('$URL_PORTAL', 'sip.$URL_PORTAL', 'grafana.$URL_PORTAL')" || true
+
+      # Update service provider root domain
+      mysql -h 127.0.0.1 -u admin -D jambones -p$NEW_DB_PASSWD -e "UPDATE service_providers SET root_domain = '$URL_PORTAL' WHERE root_domain = 'jambonz.cloud' OR root_domain IS NOT NULL" || true
+
+      # Clear stale SBC addresses
+      mysql -h 127.0.0.1 -u admin -D jambones -p$NEW_DB_PASSWD -e "DELETE FROM sbc_addresses" || true
+
+      # Configure nginx
+      sudo tee $NGINX_CONFIG > /dev/null << 'EOFNGINX'
+      server {
+          listen 80;
+          server_name URLPORTAL;
+          location /api/ {
+              rewrite ^/api/(.*)$ /$1 break;
+              proxy_pass http://127.0.0.1:3002;
+              proxy_set_header Host $host;
+          }
+          location / {
+              proxy_pass http://127.0.0.1:3001;
+              proxy_set_header Host $host;
+          }
+      }
+      server {
+          listen 80;
+          server_name api.URLPORTAL;
+          location / {
+              proxy_pass http://127.0.0.1:3002;
+              proxy_set_header Host $host;
+          }
+      }
+      server {
+          listen 80;
+          server_name grafana.URLPORTAL;
+          location / {
+              proxy_pass http://127.0.0.1:3010;
+              proxy_http_version 1.1;
+              proxy_set_header Upgrade $http_upgrade;
+              proxy_set_header Connection 'upgrade';
+              proxy_set_header Host $host;
+              proxy_cache_bypass $http_upgrade;
+          }
+      }
+      server {
+          listen 80;
+          server_name homer.URLPORTAL;
+          location / {
+              proxy_pass http://127.0.0.1:9080;
+              proxy_http_version 1.1;
+              proxy_set_header Upgrade $http_upgrade;
+              proxy_set_header Connection 'upgrade';
+              proxy_set_header Host $host;
+              proxy_cache_bypass $http_upgrade;
+          }
+      }
+      EOFNGINX
+
+      sudo sed -i "s/URLPORTAL/$URL_PORTAL/g" $NGINX_CONFIG
+      sudo systemctl restart nginx
+
+      # Configure drachtio service
+      sudo sed -i -e "s/JAMBONES_MYSQL_HOST=/JAMBONES_MYSQL_HOST=127.0.0.1/g" /etc/systemd/system/drachtio.service
+      sudo sed -i -e "s/JAMBONES_MYSQL_USER=/JAMBONES_MYSQL_USER=admin/g" /etc/systemd/system/drachtio.service
+      sudo sed -i -e "s/JAMBONES_MYSQL_PASSWORD=/JAMBONES_MYSQL_PASSWORD=$NEW_DB_PASSWD/g" /etc/systemd/system/drachtio.service
+      sudo sed -i -e "s/JAMBONES_MYSQL_DATABASE=/JAMBONES_MYSQL_DATABASE=jambones/g" /etc/systemd/system/drachtio.service
+      sudo sed -i -e "s/JAMBONES_REDIS_HOST=/JAMBONES_REDIS_HOST=127.0.0.1/g" /etc/systemd/system/drachtio.service
+      sudo sed -i -e "s/JAMBONES_REDIS_PORT=/JAMBONES_REDIS_PORT=6379/g" /etc/systemd/system/drachtio.service
+
+      # Configure freeswitch service
+      sudo sed -i -e "s/JAMBONES_MYSQL_HOST=/JAMBONES_MYSQL_HOST=127.0.0.1/g" /etc/systemd/system/freeswitch.service
+      sudo sed -i -e "s/JAMBONES_MYSQL_USER=/JAMBONES_MYSQL_USER=admin/g" /etc/systemd/system/freeswitch.service
+      sudo sed -i -e "s/JAMBONES_MYSQL_PASSWORD=/JAMBONES_MYSQL_PASSWORD=$NEW_DB_PASSWD/g" /etc/systemd/system/freeswitch.service
+      sudo sed -i -e "s/JAMBONES_MYSQL_DATABASE=/JAMBONES_MYSQL_DATABASE=jambones/g" /etc/systemd/system/freeswitch.service
+      sudo sed -i -e "s/JAMBONES_REDIS_HOST=/JAMBONES_REDIS_HOST=127.0.0.1/g" /etc/systemd/system/freeswitch.service
+      sudo sed -i -e "s/JAMBONES_REDIS_PORT=/JAMBONES_REDIS_PORT=6379/g" /etc/systemd/system/freeswitch.service
+
+      # Configure upload_recordings service
+      sudo sed -i -e "s/MYSQL_HOST=/MYSQL_HOST=127.0.0.1/g" /etc/systemd/system/upload_recordings.service
+      sudo sed -i -e "s/MYSQL_USER=/MYSQL_USER=admin/g" /etc/systemd/system/upload_recordings.service
+      sudo sed -i -e "s/MYSQL_PASSWORD=/MYSQL_PASSWORD=$NEW_DB_PASSWD/g" /etc/systemd/system/upload_recordings.service
+      sudo sed -i -e "s/MYSQL_DATABASE=/MYSQL_DATABASE=jambones/g" /etc/systemd/system/upload_recordings.service
+      sudo sed -i -e "s/BASIC_AUTH_USERNAME=/BASIC_AUTH_USERNAME=jambonz/g" /etc/systemd/system/upload_recordings.service
+      sudo sed -i -e "s/BASIC_AUTH_PASSWORD=/BASIC_AUTH_PASSWORD=$JWT_SECRET/g" /etc/systemd/system/upload_recordings.service
+      sudo sed -i -e "s/ENCRYPTION_SECRET=/ENCRYPTION_SECRET=$JWT_SECRET/g" /etc/systemd/system/upload_recordings.service
+
+      # Configure HEP endpoints for Homer
+      if [[ "$ENABLE_PCAPS" == "true" ]]; then
+        echo "Enabling PCAPs"
+        sudo sed -i -e "s/--address 0.0.0.0 --port 9022/--address 0.0.0.0 --port 9022 --homer 127.0.0.1:9060 --homer-id 10/g" /etc/systemd/system/drachtio.service
+        sudo sed -i -e "s/--delete-delay 0/--delete-delay 0 --homer=127.0.0.1:9060 --homer-protocol=udp --homer-id=11/g" /etc/systemd/system/rtpengine.service
+      fi
+
+      sudo systemctl daemon-reload
+      sudo systemctl enable upload_recordings
+      sudo systemctl start upload_recordings
+
+      sudo systemctl restart drachtio
+      sudo systemctl restart freeswitch
+      sudo systemctl restart rtpengine
+
+      # Restart heplify-server for Homer (only if pcaps enabled)
+      if [[ "$ENABLE_PCAPS" == "true" ]]; then
+        sudo systemctl restart heplify-server || true
+      else
+        sudo systemctl stop heplify-server || true
+        sudo systemctl disable heplify-server || true
+      fi
+
+      # OTEL tracing (Cassandra + Jaeger)
+      if [[ "$ENABLE_OTEL" == "true" ]]; then
+        echo "Restarting cassandra..."
+        sudo systemctl restart cassandra.service || true
+        sleep 60
+        echo "Restarting jaeger"
+        sudo systemctl restart jaeger-collector.service || true
+        sudo systemctl restart jaeger-query.service || true
+      else
+        echo "OTEL tracing disabled — stopping cassandra and jaeger..."
+        sudo systemctl stop cassandra.service || true
+        sudo systemctl stop jaeger-collector.service || true
+        sudo systemctl stop jaeger-query.service || true
+        sudo systemctl disable cassandra.service || true
+        sudo systemctl disable jaeger-collector.service || true
+        sudo systemctl disable jaeger-query.service || true
+      fi
+
+      # Configure telegraf to send to local influxdb
+      sudo sed -i -e "s/influxdb:8086/127.0.0.1:8086/g" /etc/telegraf/telegraf.conf
+      sudo systemctl restart telegraf
+
+      # Restart PM2 apps
+      sudo -u $USER bash -c "pm2 restart $HOME/apps/ecosystem.config.js" || true
+      sudo -u $USER bash -c "pm2 save" || true
+      sudo env PATH=$PATH:/usr/bin /usr/lib/node_modules/pm2/bin/pm2 startup systemd -u $USER --hp $HOME || true
+      sudo systemctl enable pm2-$USER.service
+
+      # Configure APIBan
+      APIBAN_KEY="${apiban_key}"
+      APIBAN_CLIENT_ID="${apiban_client_id}"
+      APIBAN_CLIENT_SECRET="${apiban_client_secret}"
+
+      if [ -n "$APIBAN_CLIENT_ID" ] && [ -n "$APIBAN_CLIENT_SECRET" ]; then
+          echo "Provisioning APIBan key via client credentials..."
+          APIBANKEY=$(curl -X POST -u "$APIBAN_CLIENT_ID:$APIBAN_CLIENT_SECRET" \
+              -d "{\"client\": \"$INSTANCE_ID\"}" \
+              -s https://apiban.org/sponsor/newkey | jq -r '.ApiKey' 2>/dev/null || echo "")
+          if [ -n "$APIBANKEY" ] && [ "$APIBANKEY" != "null" ] && [ -f /usr/local/bin/apiban/config.json ]; then
+              sudo sed -i -e "s/API-KEY-HERE/$APIBANKEY/g" /usr/local/bin/apiban/config.json
+              sudo /usr/local/bin/apiban/apiban-client-nftables FULL || true
+          else
+              echo "Failed to provision APIBan key via client credentials"
+          fi
+      elif [ -n "$APIBAN_KEY" ] && [ -f /usr/local/bin/apiban/config.json ]; then
+          echo "Configuring APIBan with provided key..."
+          sudo sed -i -e "s/API-KEY-HERE/$APIBAN_KEY/g" /usr/local/bin/apiban/config.json
+          sudo /usr/local/bin/apiban/apiban-client-nftables FULL || true
+      else
+          echo "Skipping APIBan configuration (no credentials provided)"
+      fi
+
+      echo "Jambonz Mini setup complete!"
+
+runcmd:
+  - /tmp/configure-jambonz.sh
+
+final_message: "Jambonz Mini is ready!"

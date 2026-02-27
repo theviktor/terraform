@@ -1,90 +1,80 @@
 #cloud-config
-# Cloud-init for Jambonz Web/Monitoring Server on Exoscale
+# Cloud-init for Jambonz Web Server on Hetzner Cloud (Large deployment)
+# Handles API server, webapp, public-apps, nginx (proxies grafana/homer to monitoring)
 
 # Merge SSH keys into existing jambonz user
-# Note: jambonz user already exists in the template, we're just adding SSH keys
 users:
   - name: jambonz
     ssh_authorized_keys:
       - "${ssh_public_key}"
 
-# Configure network interfaces (both public and private)
-network:
-  version: 2
-  ethernets:
-    eth0:
-      dhcp4: true
-    eth1:
-      dhcp4: true
-
 write_files:
-  - path: /tmp/configure-jambonz.sh
+  - path: /tmp/configure-web.sh
     permissions: '0755'
     content: |
       #!/bin/bash -xe
-      # Configuration script for jambonz Web/Monitoring server
+      # Configuration script for jambonz Web server
 
       # Variables from Terraform
       MYSQL_HOST="${mysql_host}"
-      MYSQL_PORT="${mysql_port}"
       MYSQL_USER="${mysql_user}"
       MYSQL_PASSWORD="${mysql_password}"
-      MYSQL_DATABASE="${mysql_database}"
       REDIS_HOST="${redis_host}"
       REDIS_PORT="${redis_port}"
       JWT_SECRET="${jwt_secret}"
       URL_PORTAL="${url_portal}"
       VPC_CIDR="${vpc_cidr}"
+      MONITORING_PRIVATE_IP="${monitoring_private_ip}"
       DEPLOY_RECORDING_CLUSTER="${deploy_recording_cluster}"
 
-      echo "Starting jambonz Web/Monitoring server configuration for Exoscale"
+      echo "Starting jambonz Web server configuration for Hetzner (large deployment)"
 
-      # Always use jambonz user for apps
       USER=jambonz
       HOME=/home/jambonz
+      NGINX_CONFIG=/etc/nginx/sites-available/default
 
-      # Get instance metadata from Exoscale Metadata Service
-      echo "Getting instance metadata..."
-      # Get private IP from eth1 (private network interface)
-      PRIVATE_IP=$(ip -4 addr show eth1 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' || echo "172.20.0.1")
-      INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || hostname)
-      PUBLIC_IP=$(curl -s https://api.ipify.org)
+      # Wait for private network metadata (may not be available immediately at boot)
+      echo "Waiting for Hetzner private network metadata..."
+      PRIVATE_IP=""
+      for i in $(seq 1 30); do
+          METADATA_RAW=$(curl -s http://169.254.169.254/hetzner/v1/metadata/private-networks)
+          PRIVATE_IP=$(echo "$METADATA_RAW" | grep -oP '(?<=ip: )\S+' | head -1)
+          if [ -n "$PRIVATE_IP" ]; then
+              echo "Got private IP from metadata: '$PRIVATE_IP' (attempt $i/30)"
+              break
+          fi
+          echo "Private network not yet available (attempt $i/30), metadata: $METADATA_RAW"
+          sleep 2
+      done
+      if [ -z "$PRIVATE_IP" ]; then
+          echo "FATAL: Could not determine private IP after 60 seconds"
+          exit 1
+      fi
+      INSTANCE_ID=$(curl -s http://169.254.169.254/hetzner/v1/metadata/instance-id 2>/dev/null || hostname)
+      PUBLIC_IP=$(curl -s http://169.254.169.254/hetzner/v1/metadata/public-ipv4 2>/dev/null || curl -s https://api.ipify.org)
+      echo "PUBLIC_IP: '$PUBLIC_IP'"
+      echo "INSTANCE_ID: '$INSTANCE_ID'"
 
-      echo "Public IP: $PUBLIC_IP"
-      echo "Private IP: $PRIVATE_IP (eth1)"
-      echo "Instance ID: $INSTANCE_ID"
-
-      # Wait for database to be ready
+      # Wait for database to be ready (MySQL on dedicated DB VM)
       echo "Waiting for MySQL to be ready..."
-      MYSQL_OPTS="-h $MYSQL_HOST --port=$MYSQL_PORT -u $MYSQL_USER -D $MYSQL_DATABASE -p$MYSQL_PASSWORD"
-      until mysql -h $MYSQL_HOST --port=$MYSQL_PORT -u $MYSQL_USER -p$MYSQL_PASSWORD -e "SELECT 1" &>/dev/null; do
+      MYSQL_OPTS="-h $MYSQL_HOST --port=3306 -u $MYSQL_USER -D jambones -p$MYSQL_PASSWORD"
+      until mysql $MYSQL_OPTS -e "SELECT 1" &>/dev/null; do
         echo "MySQL not ready, waiting..."
         sleep 5
       done
 
-      echo "Seeding database..."
-      DEFAULT_ACCOUNT_SID=$(uuidgen)
-      DEFAULT_TOKEN=$(uuidgen)
+      # Database schema and seed data are pre-loaded in the DB snapshot.
+      # Update the public-apps URL to use the correct domain
+      echo "Updating database with deployment-specific values..."
+      mysql $MYSQL_OPTS -e "UPDATE service_providers SET root_domain = '$URL_PORTAL' WHERE root_domain = 'jambonz.cloud' OR root_domain IS NOT NULL" || true
 
-      # Exoscale DBaaS MySQL requires primary keys on all tables and uses
-      # ANSI_QUOTES SQL mode (double quotes = identifiers). Fix both for import.
-      SQL_PREAMBLE="SET SESSION sql_require_primary_key = 0; SET SESSION sql_mode = 'NO_ENGINE_SUBSTITUTION';"
-
-      # Seed database
-      cd $HOME/apps/api-server/db
-      sudo sed -i "s/9351f46a-678c-43f5-b8a6-d4eb58d131af/$DEFAULT_ACCOUNT_SID/g" seed-production-database-open-source.sql
-      sudo sed -i "s/38700987-c7a4-4685-a5bb-af378f9734de/$DEFAULT_TOKEN/g" seed-production-database-open-source.sql
-      echo "$SQL_PREAMBLE" | cat - jambones-sql.sql | mysql $MYSQL_OPTS || true
-      sudo sed -i "s/public-apps.jambonz.cloud/public-apps.$URL_PORTAL/g" seed-production-database-open-source.sql
-      echo "$SQL_PREAMBLE" | cat - seed-production-database-open-source.sql | mysql $MYSQL_OPTS || true
-
-      # Reset admin password
+      # Reset admin password to instance ID
       JAMBONES_ADMIN_INITIAL_PASSWORD=$INSTANCE_ID \
       JAMBONES_MYSQL_HOST=$MYSQL_HOST \
-      JAMBONES_MYSQL_PORT=$MYSQL_PORT \
+      JAMBONES_MYSQL_PORT=3306 \
       JAMBONES_MYSQL_USER=$MYSQL_USER \
       JAMBONES_MYSQL_PASSWORD=$MYSQL_PASSWORD \
-      JAMBONES_MYSQL_DATABASE=$MYSQL_DATABASE \
+      JAMBONES_MYSQL_DATABASE=jambones \
       $HOME/apps/api-server/db/reset_admin_password.js || true
 
       # Add system information
@@ -97,7 +87,6 @@ write_files:
       TAG="<script>window.JAMBONZ = { API_BASE_URL: '$API_BASE_URL'};</script>"
       sed -i -e "\@</head>@i\ $TAG" $HOME/apps/webapp/dist/index.html || true
 
-      # Write PM2 ecosystem config
       echo "Writing $HOME/apps/ecosystem.config.js..."
       cat << EOF > $HOME/apps/ecosystem.config.js
       module.exports = {
@@ -120,15 +109,14 @@ write_files:
             JWT_SECRET: '$JWT_SECRET',
             AUTHENTICATION_KEY: '$JWT_SECRET',
             JAMBONES_MYSQL_HOST: '$MYSQL_HOST',
-            JAMBONES_MYSQL_PORT: $MYSQL_PORT,
             JAMBONES_MYSQL_USER: '$MYSQL_USER',
             JAMBONES_MYSQL_PASSWORD: '$MYSQL_PASSWORD',
-            JAMBONES_MYSQL_DATABASE: '$MYSQL_DATABASE',
+            JAMBONES_MYSQL_DATABASE: 'jambones',
             JAMBONES_MYSQL_CONNECTION_LIMIT: 10,
             JAMBONES_REDIS_HOST: '$REDIS_HOST',
             JAMBONES_REDIS_PORT: $REDIS_PORT,
             JAMBONE_API_VERSION: 'v1',
-            JAMBONES_TIME_SERIES_HOST: '127.0.0.1',
+            JAMBONES_TIME_SERIES_HOST: '$MONITORING_PRIVATE_IP',
             ENABLE_METRICS: 1,
             STATS_HOST: '127.0.0.1',
             STATS_PORT: 8125,
@@ -136,8 +124,8 @@ write_files:
             STATS_TELEGRAF: 1,
             STATS_SAMPLE_RATE: 1,
             HTTP_PORT: 3000,
-            JAEGER_BASE_URL: 'http://127.0.0.1:16686',
-            HOMER_BASE_URL: 'http://127.0.0.1:9080',
+            JAEGER_BASE_URL: 'http://$MONITORING_PRIVATE_IP:16686',
+            HOMER_BASE_URL: 'http://$MONITORING_PRIVATE_IP:9080',
             HOMER_USERNAME: 'admin',
             HOMER_PASSWORD: 'sipcapture',
             JAMBONZ_RECORD_WS_USERNAME: 'jambonz',
@@ -179,12 +167,12 @@ write_files:
       sudo -u $USER bash -c "pm2 save"
       sudo systemctl enable pm2-$USER.service
 
-      # Configure telegraf to send to the monitoring server (which is local)
-      sudo sed -i -e "s/influxdb:8086/127.0.0.1:8086/g" /etc/telegraf/telegraf.conf
+      # Configure telegraf to send to the monitoring server
+      sudo sed -i -e "s/influxdb:8086/$MONITORING_PRIVATE_IP:8086/g" /etc/telegraf/telegraf.conf
       sudo systemctl restart telegraf
 
-      # Configure nginx
-      sudo tee /etc/nginx/sites-available/default > /dev/null << EOFNGINX
+      # Configure nginx (proxy grafana/homer to monitoring server)
+      sudo tee $NGINX_CONFIG > /dev/null << EOFNGINX
       server {
           listen 80;
           server_name $URL_PORTAL;
@@ -210,7 +198,7 @@ write_files:
         listen 80;
         server_name grafana.$URL_PORTAL;
         location / {
-          proxy_pass http://127.0.0.1:3010;
+          proxy_pass http://$MONITORING_PRIVATE_IP:3010;
           proxy_http_version 1.1;
           proxy_set_header Upgrade \$http_upgrade;
           proxy_set_header Connection 'upgrade';
@@ -222,7 +210,7 @@ write_files:
         listen 80;
         server_name homer.$URL_PORTAL;
         location / {
-          proxy_pass http://127.0.0.1:9080;
+          proxy_pass http://$MONITORING_PRIVATE_IP:9080;
           proxy_http_version 1.1;
           proxy_set_header Upgrade \$http_upgrade;
           proxy_set_header Connection 'upgrade';
@@ -246,21 +234,11 @@ write_files:
 
       sudo systemctl restart nginx
 
-      sudo systemctl restart heplify-server.service || true
-
-      # Restart cassandra and give it time to come up
-      echo "Restarting cassandra..."
-      sudo systemctl restart cassandra.service || true
-      sleep 60
-      echo "Restarting jaeger"
-      sudo systemctl restart jaeger-collector.service || true
-      sudo systemctl restart jaeger-query.service || true
-
       # Configure upload_recordings service
       sudo sed -i -e "s/MYSQL_HOST=/MYSQL_HOST=$MYSQL_HOST/g" /etc/systemd/system/upload_recordings.service
       sudo sed -i -e "s/MYSQL_USER=/MYSQL_USER=$MYSQL_USER/g" /etc/systemd/system/upload_recordings.service
       sudo sed -i -e "s/MYSQL_PASSWORD=/MYSQL_PASSWORD=$MYSQL_PASSWORD/g" /etc/systemd/system/upload_recordings.service
-      sudo sed -i -e "s/MYSQL_DATABASE=/MYSQL_DATABASE=$MYSQL_DATABASE/g" /etc/systemd/system/upload_recordings.service
+      sudo sed -i -e "s/MYSQL_DATABASE=/MYSQL_DATABASE=jambones/g" /etc/systemd/system/upload_recordings.service
       sudo sed -i -e "s/BASIC_AUTH_USERNAME=/BASIC_AUTH_USERNAME=jambonz/g" /etc/systemd/system/upload_recordings.service
       sudo sed -i -e "s/BASIC_AUTH_PASSWORD=/BASIC_AUTH_PASSWORD=$JWT_SECRET/g" /etc/systemd/system/upload_recordings.service
       sudo sed -i -e "s/ENCRYPTION_SECRET=/ENCRYPTION_SECRET=$JWT_SECRET/g" /etc/systemd/system/upload_recordings.service
@@ -276,9 +254,9 @@ write_files:
         sudo systemctl disable upload_recordings 2>/dev/null || true
       fi
 
-      echo "Web + monitoring server setup complete!"
+      echo "Web server setup complete!"
 
 runcmd:
-  - /tmp/configure-jambonz.sh > /var/log/jambonz-setup.log 2>&1
+  - /tmp/configure-web.sh
 
-final_message: "jambonz Web/Monitoring cloud-init configuration complete after $UPTIME seconds"
+final_message: "Jambonz Web Server is ready!"

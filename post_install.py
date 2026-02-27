@@ -75,14 +75,11 @@ def create_dns_records(
     sbc_ip: str,
     dns_manager: DNSManager,
     base_domain: str,
-    monitoring_ip: str = None,
     ttl: int = 300
 ) -> bool:
     """
     Create DNS A records for the deployment.
-
-    Args:
-        monitoring_ip: If set, grafana/homer point here instead of web_ip (large deployments)
+    All HTTP records point to the web server (nginx proxies to monitoring internally).
 
     Returns:
         True if all records created successfully
@@ -92,15 +89,12 @@ def create_dns_records(
 
     subdomain = extract_subdomain(url_portal)
 
-    # For large deployments, grafana/homer point to the monitoring server
-    grafana_homer_ip = monitoring_ip or web_ip
-
-    # Define records to create
+    # Define records to create — all HTTP traffic goes through web server's nginx
     records_to_create = [
         (subdomain, web_ip),
         (f"api.{subdomain}", web_ip),
-        (f"grafana.{subdomain}", grafana_homer_ip),
-        (f"homer.{subdomain}", grafana_homer_ip),
+        (f"grafana.{subdomain}", web_ip),
+        (f"homer.{subdomain}", web_ip),
         (f"public-apps.{subdomain}", web_ip),
         (f"sip.{subdomain}", sbc_ip),
     ]
@@ -485,7 +479,7 @@ def main(terraform_dir, email, config, skip_dns, skip_tls, skip_webapp, staging)
             provider = dns_config.get('provider', 'dnsmadeeasy')
             dns_manager = DNSManager(provider=provider, config=dns_config, base_domain=base_domain)
 
-            if not create_dns_records(portal_url, web_ip, sbc_ips[0], dns_manager, base_domain, monitoring_ip=monitoring_ip):
+            if not create_dns_records(portal_url, web_ip, sbc_ips[0], dns_manager, base_domain):
                 print("❌ DNS record creation failed")
                 all_passed = False
             else:
@@ -518,18 +512,6 @@ def main(terraform_dir, email, config, skip_dns, skip_tls, skip_webapp, staging)
             all_passed = False
         else:
             print("✅ TLS certificates provisioned on web server")
-
-        # Large deployments: monitoring server has its own nginx (grafana/homer)
-        if monitoring_ip and all_passed:
-            print()
-            print(f"Provisioning TLS on monitoring server ({monitoring_ip})...")
-            print()
-
-            if not provision_tls_certificates(monitoring_ip, email, ssh_config, staging):
-                print("❌ TLS certificate provisioning failed on monitoring server")
-                all_passed = False
-            else:
-                print("✅ TLS certificates provisioned on monitoring server")
 
         print()
     elif skip_tls:

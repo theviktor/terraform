@@ -124,9 +124,8 @@ mysql_username = "admin"
 # Get a free key from https://apiban.org
 # apiban_key = "your-apiban-api-key"
 
-# Graceful scale-in timeout for Feature Servers (seconds)
-# Time to wait for active calls to complete before terminating instance
-scale_in_timeout_seconds = 900  # 15 minutes
+# Enable PCAP capture on SBC servers (sends HEP to Homer)
+enable_pcaps = true
 
 # =============================================================================
 # EXOSCALE API CREDENTIALS

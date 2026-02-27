@@ -1,0 +1,143 @@
+#cloud-config
+# Cloud-init for Jambonz Monitoring Server on Hetzner Cloud (Large deployment)
+# Handles Grafana, Homer, Jaeger, InfluxDB, Cassandra, HEPlify
+
+# Merge SSH keys into existing jambonz user
+users:
+  - name: jambonz
+    ssh_authorized_keys:
+      - "${ssh_public_key}"
+
+write_files:
+  - path: /tmp/configure-monitoring.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash -xe
+      # Configuration script for jambonz Monitoring server
+
+      # Variables from Terraform
+      URL_PORTAL="${url_portal}"
+      VPC_CIDR="${vpc_cidr}"
+      DATA_VOLUME_DEVICE="${data_volume_device}"
+      ENABLE_OTEL="${enable_otel}"
+      ENABLE_PCAPS="${enable_pcaps}"
+
+      echo "Starting jambonz Monitoring server configuration for Hetzner (large deployment)"
+
+      USER=jambonz
+      HOME=/home/jambonz
+
+      # Mount data volume at /var/lib for persistent storage
+      # Hetzner automount puts it at /mnt/HC_Volume_*, but we want /var/lib
+      if [ -n "$DATA_VOLUME_DEVICE" ] && [ -b "$DATA_VOLUME_DEVICE" ]; then
+        echo "Mounting data volume $DATA_VOLUME_DEVICE at /var/lib..."
+
+        # Unmount if Hetzner automounted it somewhere else
+        if mount | grep -q "$DATA_VOLUME_DEVICE"; then
+          AUTOMOUNT_PATH=$(mount | grep "$DATA_VOLUME_DEVICE" | awk '{print $3}')
+          echo "Volume already mounted at $AUTOMOUNT_PATH, unmounting..."
+          umount "$AUTOMOUNT_PATH"
+          # Remove automount fstab entry if present
+          sed -i "\|$DATA_VOLUME_DEVICE|d" /etc/fstab
+        fi
+
+        # Stop services that write to /var/lib
+        echo "Stopping services before /var/lib migration..."
+        systemctl stop influxdb 2>/dev/null || true
+        systemctl stop postgresql 2>/dev/null || true
+        systemctl stop postgresql-12 2>/dev/null || true
+        systemctl stop grafana-server 2>/dev/null || true
+        systemctl stop redis-server 2>/dev/null || true
+        systemctl stop redis 2>/dev/null || true
+        systemctl stop telegraf 2>/dev/null || true
+        systemctl stop cassandra 2>/dev/null || true
+
+        # Mount volume temporarily and copy existing /var/lib contents
+        TEMP_MOUNT=/mnt/data-volume
+        mkdir -p $TEMP_MOUNT
+        mount -o discard,defaults $DATA_VOLUME_DEVICE $TEMP_MOUNT
+
+        # Only copy if volume is empty (first boot)
+        if [ ! -f "$TEMP_MOUNT/.migrated" ]; then
+          echo "First boot: copying /var/lib to data volume..."
+          rsync -a /var/lib/ $TEMP_MOUNT/
+          touch $TEMP_MOUNT/.migrated
+        fi
+
+        umount $TEMP_MOUNT
+        rmdir $TEMP_MOUNT
+
+        # Mount the volume at /var/lib
+        mount -o discard,defaults $DATA_VOLUME_DEVICE /var/lib
+
+        # Add fstab entry for persistence across reboots
+        echo "$DATA_VOLUME_DEVICE /var/lib ext4 discard,defaults,nofail 0 2" >> /etc/fstab
+
+        echo "Data volume mounted at /var/lib"
+
+        # Restart services that were stopped
+        systemctl start redis-server 2>/dev/null || systemctl start redis 2>/dev/null || true
+        systemctl start postgresql 2>/dev/null || systemctl start postgresql-12 2>/dev/null || true
+        systemctl start influxdb 2>/dev/null || true
+        systemctl start grafana-server 2>/dev/null || true
+        systemctl start telegraf 2>/dev/null || true
+      else
+        echo "No data volume device found ($DATA_VOLUME_DEVICE), using root disk for /var/lib"
+      fi
+
+      # Wait for private network metadata (may not be available immediately at boot)
+      echo "Waiting for Hetzner private network metadata..."
+      PRIVATE_IP=""
+      for i in $(seq 1 30); do
+          METADATA_RAW=$(curl -s http://169.254.169.254/hetzner/v1/metadata/private-networks)
+          PRIVATE_IP=$(echo "$METADATA_RAW" | grep -oP '(?<=ip: )\S+' | head -1)
+          if [ -n "$PRIVATE_IP" ]; then
+              echo "Got private IP from metadata: '$PRIVATE_IP' (attempt $i/30)"
+              break
+          fi
+          echo "Private network not yet available (attempt $i/30), metadata: $METADATA_RAW"
+          sleep 2
+      done
+      if [ -z "$PRIVATE_IP" ]; then
+          echo "FATAL: Could not determine private IP after 60 seconds"
+          exit 1
+      fi
+      INSTANCE_ID=$(curl -s http://169.254.169.254/hetzner/v1/metadata/instance-id 2>/dev/null || hostname)
+      echo "INSTANCE_ID: '$INSTANCE_ID'"
+
+      # Configure telegraf to send locally (this IS the monitoring server)
+      sudo sed -i -e "s/influxdb:8086/127.0.0.1:8086/g" /etc/telegraf/telegraf.conf
+      sudo systemctl restart telegraf
+
+      # HEPlify server (receives HEP packets from SIP/RTP servers)
+      if [[ "$ENABLE_PCAPS" == "true" ]]; then
+        sudo systemctl restart heplify-server.service || true
+      else
+        sudo systemctl stop heplify-server.service || true
+        sudo systemctl disable heplify-server.service || true
+      fi
+
+      # OTEL tracing (Cassandra + Jaeger)
+      if [[ "$ENABLE_OTEL" == "true" ]]; then
+        echo "Restarting cassandra..."
+        sudo systemctl restart cassandra.service || true
+        sleep 60
+        echo "Restarting jaeger"
+        sudo systemctl restart jaeger-collector.service || true
+        sudo systemctl restart jaeger-query.service || true
+      else
+        echo "OTEL tracing disabled — stopping cassandra and jaeger..."
+        sudo systemctl stop cassandra.service || true
+        sudo systemctl stop jaeger-collector.service || true
+        sudo systemctl stop jaeger-query.service || true
+        sudo systemctl disable cassandra.service || true
+        sudo systemctl disable jaeger-collector.service || true
+        sudo systemctl disable jaeger-query.service || true
+      fi
+
+      echo "Monitoring server setup complete!"
+
+runcmd:
+  - /tmp/configure-monitoring.sh
+
+final_message: "Jambonz Monitoring Server is ready!"

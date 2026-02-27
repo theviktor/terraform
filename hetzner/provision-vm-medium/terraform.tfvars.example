@@ -1,0 +1,198 @@
+# =============================================================================
+# Jambonz Medium Cluster on Hetzner Cloud - Example Configuration
+# =============================================================================
+# Copy this file to terraform.tfvars and customize for your deployment
+
+# =============================================================================
+# HETZNER CLOUD AUTHENTICATION (choose one method)
+# =============================================================================
+#
+# Method 1: Provide token directly (add to this file or pass via -var)
+# hcloud_token = "your-api-token"
+#
+# Method 2: Set environment variable (recommended — keeps token out of files)
+# export HCLOUD_TOKEN="your-api-token"
+#
+# Generate a token in the Hetzner Cloud Console:
+#   Project → Security → API Tokens → Generate API Token (Read & Write)
+
+# =============================================================================
+# REQUIRED VARIABLES
+# =============================================================================
+
+# Resource naming prefix (used for all resource names)
+name_prefix = "jambonz-medium"
+
+# Hetzner Cloud location for deployment
+# Options: nbg1 (Nuremberg), fsn1 (Falkenstein), hel1 (Helsinki),
+#          ash (Ashburn VA), hil (Hillsboro OR), sgp1 (Singapore)
+location = "nbg1"
+
+# Domain name for the portal (DNS A records will need to be created)
+url_portal = "jambonz.example.com"
+
+# =============================================================================
+# SSH KEY CONFIGURATION (choose one method)
+# =============================================================================
+
+# Method 1: Provide your SSH public key directly
+ssh_public_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC... your-email@example.com"
+
+# Method 2: Use an existing Hetzner SSH key name (comment out ssh_public_key above)
+# ssh_key_name = "my-hetzner-key"
+
+# =============================================================================
+# JAMBONZ SNAPSHOT IDS
+# =============================================================================
+# Build jambonz snapshots with Packer, then provide their IDs here.
+
+image_web_monitoring = "0"   # jambonz-web-monitoring snapshot ID
+image_sbc            = "0"   # jambonz-sip-rtp snapshot ID
+image_feature_server = "0"   # jambonz-fs snapshot ID
+image_db             = "0"   # jambonz-db snapshot ID (MySQL pre-installed)
+# image_recording    = "0"   # jambonz-recording snapshot ID (if using recording)
+
+# =============================================================================
+# MINIMAL COST CONFIGURATION (Testing/Development)
+# =============================================================================
+# Recommended for testing with 1 SBC and 1 Feature Server.
+# All servers default to CX33 (4 vCPU, 8 GB RAM, 80 GB local disk).
+# Additional volumes bring total storage to target sizes.
+
+## Instance Counts
+#sbc_count                = 1      # 1 SBC server
+#feature_server_count     = 1      # 1 Feature Server
+#recording_server_count   = 1      # Not used when deploy_recording_cluster=false
+#deploy_recording_cluster = false  # Disable recording to save costs
+
+## Server Types (CX33 = 4 vCPU, 8 GB RAM — default for all)
+## NOTE: Not all server types are available in all locations.
+## To list available types: hcloud server-type list
+#server_type_web       = "cx33"
+#server_type_db        = "cx33"
+#server_type_sbc       = "cx33"
+#server_type_feature   = "cx33"
+#server_type_recording = "cx33"
+
+## Additional Volume Sizes (added to server's built-in 80 GB disk)
+#volume_size_web       = 120  # 80 + 120 = 200 GB total
+#volume_size_db        = 70   # 80 + 70  = 150 GB total
+#volume_size_sbc       = 20   # 80 + 20  = 100 GB total
+#volume_size_feature   = 20   # 80 + 20  = 100 GB total
+#volume_size_recording = 20   # 80 + 20  = 100 GB total
+
+# =============================================================================
+# PRODUCTION CONFIGURATION (High Availability)
+# =============================================================================
+
+## Instance Counts
+sbc_count                = 1     
+feature_server_count     = 1     
+recording_server_count   = 1      
+deploy_recording_cluster = true
+
+## Server Types (list available types with: hcloud server-type list)
+server_type_web       = "cx33"   # 4 vCPU, 8 GB RAM
+server_type_db        = "cx33"   # 4 vCPU, 8 GB RAM
+server_type_sbc       = "cx33"   # 4 vCPU, 8 GB RAM
+server_type_feature   = "cx33"   # 4 vCPU, 8 GB RAM
+server_type_recording = "cx33"   # 4 vCPU, 8 GB RAM
+
+## Additional Volume Sizes
+volume_size_web       = 120  # 80 + 120 = 200 GB total
+volume_size_db        = 70   # 80 + 70  = 150 GB total
+volume_size_sbc       = 20   # 80 + 20  = 100 GB total
+volume_size_feature   = 20   # 80 + 20  = 100 GB total
+volume_size_recording = 20   # 80 + 20  = 100 GB total
+
+# =============================================================================
+# NETWORK CONFIGURATION
+# =============================================================================
+
+# Private network CIDR (default: 172.20.0.0/16)
+vpc_cidr = "172.20.0.0/16"
+
+# =============================================================================
+# SECURITY CONFIGURATION
+# =============================================================================
+
+# CIDR blocks for access control (use 0.0.0.0/0 for open access)
+# IMPORTANT: Restrict these to your IP ranges for production!
+
+allowed_ssh_cidr  = "0.0.0.0/0"  # SSH access to all servers
+allowed_sbc_cidr  = "0.0.0.0/0"  # SIP/RTP traffic to SBC servers
+allowed_http_cidr = "0.0.0.0/0"  # HTTP/HTTPS to web/monitoring
+
+# For production, use specific IP ranges:
+# allowed_ssh_cidr  = "203.0.113.0/24"    # Your office IP range
+# allowed_sbc_cidr  = "198.51.100.0/24"   # Your SIP provider IP range
+# allowed_http_cidr = "203.0.113.0/24"    # Your office/VPN IP range
+
+# =============================================================================
+# DATABASE CREDENTIALS
+# =============================================================================
+
+# MySQL username (default: admin)
+mysql_username = "admin"
+
+# MySQL password (leave empty for auto-generation - recommended)
+# mysql_password = ""  # Auto-generated if not provided
+
+# =============================================================================
+# OPTIONAL FEATURES
+# =============================================================================
+
+# APiBan for fraud/spam IP blocking (optional)
+# Get a free key from https://apiban.org
+# apiban_key = "your-apiban-api-key"
+
+# Or use multi-key mode with client ID and secret
+# apiban_client_id     = "your-client-id"
+# apiban_client_secret = "your-client-secret"
+
+# PCAP capture via Homer HEP endpoint on SBC servers (default: enabled)
+# Set to "false" to disable SIP/RTP packet capture
+# enable_pcaps = "false"
+
+# OpenTelemetry tracing with Cassandra + Jaeger on monitoring server (default: enabled)
+# Set to "false" to disable and save resources
+# enable_otel = "false"
+
+# Graceful scale-in timeout for Feature Servers (seconds)
+# Time to wait for active calls to complete before terminating instance
+scale_in_timeout_seconds = 900  # 15 minutes
+
+# =============================================================================
+# NOTES
+# =============================================================================
+#
+# 1. DNS CONFIGURATION:
+#    After deployment, create DNS A records pointing to the outputted IPs:
+#    - jambonz.example.com → Web/Monitoring IP
+#    - api.jambonz.example.com → Web/Monitoring IP
+#    - grafana.jambonz.example.com → Web/Monitoring IP
+#    - homer.jambonz.example.com → Web/Monitoring IP
+#    - sip.jambonz.example.com → First SBC IP
+#
+# 2. ARCHITECTURE:
+#    - MySQL runs on a dedicated DB VM (not a managed service)
+#    - Redis runs locally on the web-monitoring VM
+#    - All inter-server communication flows over the private network
+#
+# 3. SSH ACCESS:
+#    - Web/Monitoring and SBC servers have public IPs (direct SSH)
+#    - DB, Feature, and Recording servers are firewalled to SSH-only on public
+#    - Use SBC as a jump/bastion server to access private servers:
+#      ssh -J jambonz@<sbc-ip> jambonz@<feature-server-private-ip>
+#      ssh -J jambonz@<sbc-ip> root@<db-private-ip>
+#
+# 4. SERVER TYPES:
+#    Not all server types are available in all locations. Hetzner periodically
+#    retires older plan names and introduces new ones. To list available types:
+#      hcloud server-type list
+#    Common x86 shared types: cx23, cx33, cx43, cx53, cpx22, cpx32, cpx42
+#    ARM types (select locations): cax11, cax21, cax31, cax41
+#
+# 5. SCALING:
+#    You can scale Feature Servers (1-10) and Recording Servers (1-10)
+#    by updating the counts in this file and running terraform apply.

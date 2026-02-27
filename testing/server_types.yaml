@@ -31,8 +31,10 @@ server_types:
   web-monitoring:
     description: "Web portal, API, and monitoring services (combined)"
     systemd_services:
-      - cassandra
+      - postgresql
+      - homer-app
       - heplify-server
+      - cassandra
       - jaeger-query
       - jaeger-collector
       - grafana-server
@@ -57,8 +59,10 @@ server_types:
   monitoring:
     description: "Monitoring and observability services only"
     systemd_services:
-      - cassandra
+      - postgresql
+      - homer-app
       - heplify-server
+      - cassandra
       - jaeger-query
       - jaeger-collector
       - grafana-server
@@ -103,6 +107,7 @@ server_types:
       - inbound
       - outbound
       - sbc-call-router
+      - sbc-sip-sidecar
 
   # RTP Server (Large deployment - RTP media only)
   rtp:
@@ -113,7 +118,14 @@ server_types:
       - telegraf
     pm2_processes:
       - sbc-rtpengine-sidecar
-      - sbc-sip-sidecar
+
+  # Database Server (medium/large deployment - dedicated MySQL + Redis)
+  db:
+    description: "Database server running MySQL and Redis"
+    systemd_services:
+      - mysql
+      - redis
+    pm2_processes: []
 
 # Deployment configurations
 # Maps deployment sizes to server types
@@ -199,11 +211,20 @@ service_checks:
     oci:
       command: "sudo cloud-init status"
       success_indicator: "status: done"
+    hetzner:
+      command: "sudo cloud-init status"
+      success_indicator: "status: done"
 
 # Optional services that won't cause failures if missing
 optional_services:
   systemd:
-    - telegraf  # Metrics collection - optional for testing
+    - telegraf        # Metrics collection - optional for testing
+    - postgresql      # Only running if PCAPs/Homer enabled
+    - homer-app       # Only running if PCAPs/Homer enabled
+    - heplify-server  # Only running if PCAPs/Homer enabled
+    - cassandra       # Only running if OTEL tracing enabled
+    - jaeger-query    # Only running if OTEL tracing enabled
+    - jaeger-collector # Only running if OTEL tracing enabled
   pm2:
     - sbc-rtpengine-sidecar  # Sidecar processes
     - sbc-sip-sidecar
@@ -235,6 +256,11 @@ service_aliases:
     redis:
       - redis-server
       - redis.service
+    postgresql:
+      - postgresql.service
+      - postgres
+    homer-app:
+      - homer-app.service
 
   # PM2 process aliases
   pm2:

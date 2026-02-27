@@ -1,28 +1,11 @@
 #cloud-config
-# Cloud-init for Jambonz Feature Server on Exoscale
+# Cloud-init for Jambonz Feature Server on Hetzner Cloud
 
-# Copy SSH keys from default user to jambonz user
-bootcmd:
-  - |
-    set -e
-    # Wait for default user home directory
-    while [ ! -d /home/debian/.ssh ]; do sleep 1; done
-    # Copy SSH keys to jambonz user
-    if [ -d /home/debian/.ssh ] && [ -d /home/jambonz ]; then
-      cp -r /home/debian/.ssh /home/jambonz/ || true
-      chown -R jambonz:jambonz /home/jambonz/.ssh || true
-      chmod 700 /home/jambonz/.ssh || true
-      chmod 600 /home/jambonz/.ssh/authorized_keys || true
-    fi
-
-# Configure network interfaces (both public and private)
-network:
-  version: 2
-  ethernets:
-    eth0:
-      dhcp4: true
-    eth1:
-      dhcp4: true
+# Merge SSH keys into existing jambonz user
+users:
+  - name: jambonz
+    ssh_authorized_keys:
+      - "${ssh_public_key}"
 
 write_files:
   - path: /tmp/configure-feature-server.sh
@@ -33,10 +16,8 @@ write_files:
 
       # Variables from Terraform
       MYSQL_HOST="${mysql_host}"
-      MYSQL_PORT="${mysql_port}"
       MYSQL_USER="${mysql_user}"
       MYSQL_PASSWORD="${mysql_password}"
-      MYSQL_DATABASE="${mysql_database}"
       REDIS_HOST="${redis_host}"
       REDIS_PORT="${redis_port}"
       JWT_SECRET="${jwt_secret}"
@@ -44,20 +25,32 @@ write_files:
       VPC_CIDR="${vpc_cidr}"
       URL_PORTAL="${url_portal}"
       RECORDING_WS_BASE_URL="${recording_ws_base_url}"
+      ENABLE_OTEL="${enable_otel}"
 
-      echo "Starting jambonz Feature Server configuration for Exoscale"
+      echo "Starting jambonz Feature Server configuration for Hetzner"
 
       USER=jambonz
       HOME=/home/jambonz
 
-      # Get instance metadata
-      echo "Getting instance metadata..."
-      # Get private IP from eth1 (private network interface)
-      PRIVATE_IP=$(ip -4 addr show eth1 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' || echo "172.20.0.1")
-      INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || hostname)
-
-      echo "Private IP: $PRIVATE_IP (eth1)"
-      echo "Instance ID: $INSTANCE_ID"
+      # Wait for private network metadata (may not be available immediately at boot)
+      echo "Waiting for Hetzner private network metadata..."
+      PRIVATE_IP=""
+      for i in $(seq 1 30); do
+          METADATA_RAW=$(curl -s http://169.254.169.254/hetzner/v1/metadata/private-networks)
+          PRIVATE_IP=$(echo "$METADATA_RAW" | grep -oP '(?<=ip: )\S+' | head -1)
+          if [ -n "$PRIVATE_IP" ]; then
+              echo "Got private IP from metadata: '$PRIVATE_IP' (attempt $i/30)"
+              break
+          fi
+          echo "Private network not yet available (attempt $i/30), metadata: $METADATA_RAW"
+          sleep 2
+      done
+      if [ -z "$PRIVATE_IP" ]; then
+          echo "FATAL: Could not determine private IP after 60 seconds"
+          exit 1
+      fi
+      INSTANCE_ID=$(curl -s http://169.254.169.254/hetzner/v1/metadata/instance-id 2>/dev/null || hostname)
+      echo "INSTANCE_ID: '$INSTANCE_ID'"
 
       # Wait for Redis to be ready
       echo "Waiting for Redis at $REDIS_HOST:$REDIS_PORT..."
@@ -69,6 +62,13 @@ write_files:
           echo "Redis not yet available, attempt $i/60..."
           sleep 10
       done
+
+      # OTEL tracing config
+      if [[ "$ENABLE_OTEL" == "true" ]]; then
+        OTEL_ENABLED=1
+      else
+        OTEL_ENABLED=0
+      fi
 
       echo "Writing $HOME/apps/ecosystem.config.js..."
 
@@ -98,16 +98,15 @@ write_files:
             STATS_PROTOCOL: 'tcp',
             STATS_TELEGRAF: 1,
             STATS_SAMPLE_RATE: 1,
-            JAMBONES_OTEL_ENABLED: 1,
+            JAMBONES_OTEL_ENABLED: $OTEL_ENABLED,
             OTEL_EXPORTER_JAEGER_ENDPOINT: 'http://$WEB_MONITORING_PRIVATE_IP:14268/api/traces',
             OTEL_EXPORTER_OTLP_METRICS_INSECURE: 1,
             OTEL_EXPORTER_JAEGER_GRPC_INSECURE: 1,
             JAMBONES_NETWORK_CIDR: '$VPC_CIDR',
             JAMBONES_MYSQL_HOST: '$MYSQL_HOST',
-            JAMBONES_MYSQL_PORT: $MYSQL_PORT,
             JAMBONES_MYSQL_USER: '$MYSQL_USER',
             JAMBONES_MYSQL_PASSWORD: '$MYSQL_PASSWORD',
-            JAMBONES_MYSQL_DATABASE: '$MYSQL_DATABASE',
+            JAMBONES_MYSQL_DATABASE: 'jambones',
             JAMBONES_MYSQL_CONNECTION_LIMIT: 10,
             JAMBONES_REDIS_HOST: '$REDIS_HOST',
             JAMBONES_REDIS_PORT: $REDIS_PORT,
@@ -133,16 +132,34 @@ write_files:
 
       # Configure freeswitch service
       sudo sed -i -e "s/JAMBONES_MYSQL_HOST=/JAMBONES_MYSQL_HOST=$MYSQL_HOST/g" /etc/systemd/system/freeswitch.service
-      sudo sed -i -e "s/JAMBONES_MYSQL_PORT=/JAMBONES_MYSQL_PORT=$MYSQL_PORT/g" /etc/systemd/system/freeswitch.service
       sudo sed -i -e "s/JAMBONES_MYSQL_USER=/JAMBONES_MYSQL_USER=$MYSQL_USER/g" /etc/systemd/system/freeswitch.service
       sudo sed -i -e "s/JAMBONES_MYSQL_PASSWORD=/JAMBONES_MYSQL_PASSWORD=$MYSQL_PASSWORD/g" /etc/systemd/system/freeswitch.service
-      sudo sed -i -e "s/JAMBONES_MYSQL_DATABASE=/JAMBONES_MYSQL_DATABASE=$MYSQL_DATABASE/g" /etc/systemd/system/freeswitch.service
+      sudo sed -i -e "s/JAMBONES_MYSQL_DATABASE=/JAMBONES_MYSQL_DATABASE=jambones/g" /etc/systemd/system/freeswitch.service
       sudo sed -i -e "s/JAMBONES_REDIS_HOST=/JAMBONES_REDIS_HOST=$REDIS_HOST/g" /etc/systemd/system/freeswitch.service
       sudo sed -i -e "s/JAMBONES_REDIS_PORT=/JAMBONES_REDIS_PORT=$REDIS_PORT/g" /etc/systemd/system/freeswitch.service
 
+      # On Hetzner, FreeSWITCH auto-detects local_ip_v4 as the public IP (eth0)
+      # since the default route points there. Override it to use the private IP
+      # by inserting an explicit set before the domain line that references it.
+      echo "Overriding FreeSWITCH local_ip_v4 to '$PRIVATE_IP' in /usr/local/freeswitch/conf/vars.xml"
+      echo "Before sed - lines around domain in vars.xml:"
+      grep -n "local_ip_v4\|domain=" /usr/local/freeswitch/conf/vars.xml || true
+      sudo sed -i "/<X-PRE-PROCESS cmd=\"set\" data=\"domain=/i\\  <X-PRE-PROCESS cmd=\"set\" data=\"local_ip_v4=$PRIVATE_IP\"/>" /usr/local/freeswitch/conf/vars.xml
+      echo "After sed - lines around domain in vars.xml:"
+      grep -n "local_ip_v4\|domain=" /usr/local/freeswitch/conf/vars.xml || true
+
       sudo systemctl daemon-reload
+      sleep 5
       sudo systemctl restart drachtio
+      echo "Waiting 5 seconds for drachtio to fully start..."
+      sleep 5
       sudo systemctl restart freeswitch
+      echo "Waiting 5 seconds for freeswitch to fully start..."
+      sleep 5
+      echo "Verifying FreeSWITCH local_ip_v4:"
+      sudo /usr/local/freeswitch/bin/fs_cli -x "global_getvar local_ip_v4" || true
+      echo "Verifying FreeSWITCH sofia status:"
+      sudo /usr/local/freeswitch/bin/fs_cli -x "sofia status" || true
 
       # Configure telegraf to send to the monitoring server
       sudo sed -i -e "s/influxdb:8086/$WEB_MONITORING_PRIVATE_IP:8086/g" /etc/telegraf/telegraf.conf
@@ -156,6 +173,6 @@ write_files:
       echo "Feature Server setup complete!"
 
 runcmd:
-  - /tmp/configure-feature-server.sh > /var/log/jambonz-setup.log 2>&1
+  - /tmp/configure-feature-server.sh
 
-final_message: "jambonz Feature Server cloud-init configuration complete after $UPTIME seconds"
+final_message: "Jambonz Feature Server is ready!"

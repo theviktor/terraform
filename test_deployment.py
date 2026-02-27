@@ -89,7 +89,7 @@ def run_terraform_output(terraform_dir: Path) -> dict:
 
 def get_mig_instance_ips(mig_filter: str, project_id: str) -> list:
     """
-    Get private IPs of instances in a managed instance group.
+    Get private IPs of instances in a managed instance group (GCP).
 
     Args:
         mig_filter: Filter pattern (e.g., "name~-fs-" for feature servers)
@@ -128,20 +128,16 @@ def detect_provider(terraform_dir: Path) -> str:
     """
     dir_name = terraform_dir.resolve().parent.name.lower()
 
-    if 'gcp' in dir_name:
-        return 'gcp'
-    elif 'aws' in dir_name:
-        return 'aws'
-    elif 'azure' in dir_name:
-        return 'azure'
-    elif 'exoscale' in dir_name:
-        return 'exoscale'
-    elif 'oci' in dir_name:
-        return 'oci'
-    else:
-        # Default to gcp if can't detect
-        print("⚠️  Could not detect provider from directory, assuming GCP")
-        return 'gcp'
+    providers = {
+        'gcp': 'gcp', 'aws': 'aws', 'azure': 'azure',
+        'exoscale': 'exoscale', 'oci': 'oci', 'hetzner': 'hetzner'
+    }
+    for key, value in providers.items():
+        if key in dir_name:
+            return value
+
+    print("⚠️  Could not detect provider from directory, assuming GCP")
+    return 'gcp'
 
 
 def test_ssh_connectivity_wrapper(host: str, ssh_config: dict, jump_host: str = None) -> bool:
@@ -161,7 +157,6 @@ def check_startup_script(host: str, provider: str, ssh_config: dict, server_type
     Returns:
         (success: bool, message: str)
     """
-    # Get provider-specific check from config
     startup_checks = server_types_config.get('service_checks', {}).get('startup_scripts', {})
     provider_check = startup_checks.get(provider.lower())
 
@@ -169,7 +164,6 @@ def check_startup_script(host: str, provider: str, ssh_config: dict, server_type
         check_cmd = provider_check.get('command')
         success_indicator = provider_check.get('success_indicator')
     else:
-        # Fallback to defaults
         if provider == 'gcp':
             check_cmd = "sudo systemctl status google-startup-scripts.service --no-pager | head -20"
             success_indicator = "Main PID:"
@@ -186,11 +180,7 @@ def check_startup_script(host: str, provider: str, ssh_config: dict, server_type
             timeout=30
         )
 
-        # For GCP, check for successful completion indicators
         if provider.lower() == 'gcp':
-            # Success if:
-            # 1. Has Main PID (it ran)
-            # 2. Shows "status=0/SUCCESS" or "Deactivated successfully"
             has_pid = "Main PID:" in stdout
             has_success = ("status=0/SUCCESS" in stdout or "Deactivated successfully" in stdout)
 
@@ -201,7 +191,6 @@ def check_startup_script(host: str, provider: str, ssh_config: dict, server_type
             else:
                 return (False, "Startup script not complete or failed")
         else:
-            # For other providers, use the success indicator
             if exit_code == 0 and success_indicator in stdout:
                 return (True, "Startup script completed")
             else:
@@ -224,7 +213,6 @@ def check_systemd_services(host: str, expected_services: list, ssh_config: dict,
     failed_required = []
 
     for service in expected_services:
-        # Build list of service names to try (primary + aliases)
         services_to_try = [service]
         if service in service_aliases:
             services_to_try.extend(service_aliases[service])
@@ -245,7 +233,7 @@ def check_systemd_services(host: str, expected_services: list, ssh_config: dict,
                 last_status = stdout.strip()
                 if last_status == "active":
                     is_active = True
-                    break  # Found an active alias, no need to check more
+                    break
 
             except SSHError as e:
                 last_status = f"error: {e}"
@@ -283,7 +271,6 @@ def check_pm2_services(host: str, expected_services: list, ssh_config: dict, opt
         if exit_code != 0:
             return (False, "PM2 not responding", stdout)
 
-        # Check each expected service
         missing = []
         offline = []
 
@@ -292,8 +279,6 @@ def check_pm2_services(host: str, expected_services: list, ssh_config: dict, opt
                 if service not in optional_services:
                     missing.append(service)
             else:
-                # Check if this specific service is online
-                # Look for the service line in the output
                 lines = stdout.split('\n')
                 for line in lines:
                     if service in line and 'online' not in line.lower():
@@ -310,6 +295,331 @@ def check_pm2_services(host: str, expected_services: list, ssh_config: dict, opt
 
     except SSHError as e:
         return (False, f"SSH error: {e}", "")
+
+
+def test_server(label: str, ip: str, server_type_name: str, server_types: dict,
+                provider: str, ssh_config: dict, server_types_config: dict,
+                optional_systemd: list, optional_pm2: list, systemd_aliases: dict,
+                verbose: bool, jump_host: str = None, ssh_user: str = None) -> bool:
+    """
+    Run all checks (SSH, cloud-init, systemd, PM2) for a single server.
+
+    Returns True if all required checks pass.
+    """
+    passed = True
+    orig_user = ssh_config.get('user')
+
+    # Temporarily override SSH user if needed (e.g., root for DB server)
+    if ssh_user:
+        ssh_config['user'] = ssh_user
+
+    try:
+        if jump_host:
+            print(f"Testing SSH connectivity via jump host {jump_host}...")
+        else:
+            print(f"Testing SSH connectivity to {ip}...")
+        if test_ssh_connectivity_wrapper(ip, ssh_config, jump_host=jump_host):
+            print("✅ SSH connectivity OK")
+        else:
+            print("❌ SSH connectivity FAILED")
+            return False
+        print()
+
+        print("Checking startup script...")
+        success, message = check_startup_script(ip, provider, ssh_config, server_types_config, jump_host=jump_host)
+        if success:
+            print(f"✅ {message}")
+        else:
+            print(f"❌ {message}")
+            passed = False
+        print()
+
+        server_type = server_types.get(server_type_name, {})
+        expected_systemd = server_type.get('systemd_services', [])
+        expected_pm2 = server_type.get('pm2_processes', [])
+
+        if expected_systemd:
+            print("Checking systemd services...")
+            success, message, details = check_systemd_services(
+                ip, expected_systemd, ssh_config, optional_systemd, systemd_aliases, jump_host=jump_host)
+            if success:
+                print(f"✅ {message}")
+            else:
+                print(f"❌ {message}")
+                print("  Service status:")
+                for svc, status in details.items():
+                    symbol = "✅" if status == "active" else "❌"
+                    print(f"    {symbol} {svc}: {status}")
+                passed = False
+            print()
+
+        if expected_pm2:
+            print("Checking PM2 services...")
+            success, message, pm2_details = check_pm2_services(
+                ip, expected_pm2, ssh_config, optional_pm2, jump_host=jump_host)
+            if success:
+                print(f"✅ {message}")
+            else:
+                print(f"❌ {message}")
+                passed = False
+
+            if verbose and pm2_details:
+                print()
+                print("PM2 Status:")
+                print("-" * 70)
+                print(pm2_details)
+                print("-" * 70)
+            print()
+
+    finally:
+        # Restore original user
+        if ssh_user and orig_user is not None:
+            ssh_config['user'] = orig_user
+
+    return passed
+
+
+def build_server_list(tf_outputs: dict, tf_dir: Path, provider: str) -> list:
+    """
+    Build a list of servers to test from terraform outputs.
+
+    Returns list of dicts:
+        [{ 'label': str, 'type': str, 'ips': [str], 'jump_host': str|None, 'ssh_user': str|None }, ...]
+    """
+    is_mini = 'mini' in str(tf_dir).lower()
+    is_large = 'large' in str(tf_dir).lower()
+    servers = []
+
+    if is_mini:
+        # Mini: single all-in-one VM
+        ip = (tf_outputs.get('public_ip') or tf_outputs.get('server_ip')
+              or tf_outputs.get('web_monitoring_public_ip'))
+        if ip:
+            servers.append({
+                'label': 'Mini Server (All-in-one)',
+                'type': 'mini',
+                'ips': [ip],
+                'jump_host': None,
+                'ssh_user': None,
+            })
+        return servers
+
+    if is_large:
+        # Large: separate monitoring, web, SIP, RTP, feature, recording, DB
+
+        # Monitoring server
+        monitoring_ip = tf_outputs.get('monitoring_public_ip')
+        if monitoring_ip:
+            servers.append({
+                'label': 'Monitoring Server',
+                'type': 'monitoring',
+                'ips': [monitoring_ip],
+                'jump_host': None,
+                'ssh_user': None,
+            })
+
+        # Web server
+        web_ip = tf_outputs.get('web_public_ip')
+        if web_ip:
+            servers.append({
+                'label': 'Web Server',
+                'type': 'web',
+                'ips': [web_ip],
+                'jump_host': None,
+                'ssh_user': None,
+            })
+
+        # SIP servers
+        sip_ips = tf_outputs.get('sip_public_ips', [])
+        if sip_ips:
+            servers.append({
+                'label': 'SIP Server',
+                'type': 'sip',
+                'ips': sip_ips,
+                'jump_host': None,
+                'ssh_user': None,
+            })
+
+        # RTP servers
+        rtp_ips = tf_outputs.get('rtp_public_ips', [])
+        if rtp_ips:
+            servers.append({
+                'label': 'RTP Server',
+                'type': 'rtp',
+                'ips': rtp_ips,
+                'jump_host': None,
+                'ssh_user': None,
+            })
+
+        # Feature servers
+        fs_ips = tf_outputs.get('feature_server_public_ips', [])
+        if fs_ips:
+            servers.append({
+                'label': 'Feature Server',
+                'type': 'feature-server',
+                'ips': fs_ips,
+                'jump_host': None,
+                'ssh_user': None,
+            })
+
+        # Recording servers
+        rec_ips = tf_outputs.get('recording_server_public_ips', [])
+        if rec_ips:
+            servers.append({
+                'label': 'Recording Server',
+                'type': 'recording',
+                'ips': rec_ips,
+                'jump_host': None,
+                'ssh_user': None,
+            })
+
+        # Database server (private IP, accessed via jump host)
+        db_ip = tf_outputs.get('db_private_ip')
+        if db_ip:
+            # Use first SIP server as jump host, fallback to web
+            jump = sip_ips[0] if sip_ips else web_ip
+            servers.append({
+                'label': 'Database Server',
+                'type': 'db',
+                'ips': [db_ip],
+                'jump_host': jump,
+                'ssh_user': 'jambonz',
+            })
+
+        return servers
+
+    # Medium: web-monitoring, SBC, feature, recording, DB
+
+    # Web/Monitoring server
+    web_ip = tf_outputs.get('web_monitoring_public_ip')
+    if web_ip:
+        servers.append({
+            'label': 'Web/Monitoring Server',
+            'type': 'web-monitoring',
+            'ips': [web_ip],
+            'jump_host': None,
+            'ssh_user': None,
+        })
+
+    # SBC servers
+    sbc_ips = tf_outputs.get('sbc_public_ips', [])
+    if sbc_ips:
+        servers.append({
+            'label': 'SBC Server',
+            'type': 'sbc',
+            'ips': sbc_ips,
+            'jump_host': None,
+            'ssh_user': None,
+        })
+
+    # Feature servers — try public IPs first, fall back to private via jump
+    fs_public_ips = tf_outputs.get('feature_server_public_ips', [])
+    fs_private_ips = tf_outputs.get('feature_server_private_ips', [])
+    # Flatten nested lists (some providers output [[ip], [ip]])
+    fs_private_ips = [ip[0] if isinstance(ip, list) else ip for ip in fs_private_ips]
+
+    if fs_public_ips:
+        servers.append({
+            'label': 'Feature Server',
+            'type': 'feature-server',
+            'ips': fs_public_ips,
+            'jump_host': None,
+            'ssh_user': None,
+        })
+    elif fs_private_ips:
+        jump = sbc_ips[0] if sbc_ips else web_ip
+        servers.append({
+            'label': 'Feature Server',
+            'type': 'feature-server',
+            'ips': fs_private_ips,
+            'jump_host': jump,
+            'ssh_user': None,
+        })
+
+    # Recording servers — same pattern
+    rec_public_ips = tf_outputs.get('recording_server_public_ips', [])
+    rec_private_ips = tf_outputs.get('recording_server_private_ips', [])
+    rec_private_ips = [ip[0] if isinstance(ip, list) else ip for ip in rec_private_ips]
+
+    if rec_public_ips:
+        servers.append({
+            'label': 'Recording Server',
+            'type': 'recording',
+            'ips': rec_public_ips,
+            'jump_host': None,
+            'ssh_user': None,
+        })
+    elif rec_private_ips:
+        jump = sbc_ips[0] if sbc_ips else web_ip
+        servers.append({
+            'label': 'Recording Server',
+            'type': 'recording',
+            'ips': rec_private_ips,
+            'jump_host': jump,
+            'ssh_user': None,
+        })
+
+    # Database server (private IP, accessed via jump host)
+    db_ip = tf_outputs.get('db_private_ip')
+    if db_ip:
+        jump = sbc_ips[0] if sbc_ips else web_ip
+        servers.append({
+            'label': 'Database Server',
+            'type': 'db',
+            'ips': [db_ip],
+            'jump_host': jump,
+            'ssh_user': 'jambonz',
+        })
+
+    return servers
+
+
+def build_server_list_gcp(tf_outputs: dict, tf_dir: Path, server_list: list) -> list:
+    """
+    Handle GCP MIG-based feature/recording servers.
+    Appends MIG instances to the server list if detected.
+
+    Returns the extended server list.
+    """
+    feature_server_mig = tf_outputs.get('feature_server_mig_name')
+    recording_mig = tf_outputs.get('recording_mig_name')
+
+    if not feature_server_mig and not recording_mig:
+        return server_list
+
+    # Get project ID
+    project_id = tf_dir.parent.parent.name
+    if 'project_id' in tf_outputs:
+        project_id = tf_outputs['project_id']
+    elif 'service_account_email' in tf_outputs:
+        email = tf_outputs['service_account_email']
+        project_id = email.split('@')[1].split('.')[0]
+
+    web_ip = tf_outputs.get('web_monitoring_public_ip') or tf_outputs.get('web_public_ip')
+
+    if feature_server_mig:
+        fs_instances = get_mig_instance_ips("name~-fs-", project_id)
+        if fs_instances:
+            server_list.append({
+                'label': 'Feature Server (MIG)',
+                'type': 'feature-server',
+                'ips': [ip for _, ip in fs_instances],
+                'jump_host': web_ip,
+                'ssh_user': None,
+            })
+
+    if recording_mig and recording_mig != "Not deployed":
+        rec_instances = get_mig_instance_ips("name~-recording-", project_id)
+        if rec_instances:
+            server_list.append({
+                'label': 'Recording Server (MIG)',
+                'type': 'recording',
+                'ips': [ip for _, ip in rec_instances],
+                'jump_host': web_ip,
+                'ssh_user': None,
+            })
+
+    return server_list
 
 
 @click.command()
@@ -335,7 +645,7 @@ def main(terraform_dir, config, verbose):
     Verifies:
     - SSH connectivity to all VMs
     - Cloud-init/startup scripts completed
-    - PM2 services are running
+    - Systemd and PM2 services are running
     """
     print("=" * 70)
     print("Jambonz Deployment Test - Step 1: Verify Infrastructure")
@@ -363,15 +673,14 @@ def main(terraform_dir, config, verbose):
     optional_pm2 = server_types_config.get('optional_services', {}).get('pm2', [])
     systemd_aliases = server_types_config.get('service_aliases', {}).get('systemd', {})
 
-    # Load SSH config - try multiple locations
+    # Load SSH config
     if config:
         config_path = Path(config)
     else:
-        # Try multiple default locations
         possible_paths = [
-            SCRIPT_DIR / "testing" / "config.yaml",  # Relative to script
-            Path.cwd() / "config.yaml",  # Current directory
-            Path.cwd() / "testing" / "config.yaml",  # Current/testing
+            SCRIPT_DIR / "testing" / "config.yaml",
+            Path.cwd() / "config.yaml",
+            Path.cwd() / "testing" / "config.yaml",
         ]
 
         config_path = None
@@ -416,344 +725,64 @@ def main(terraform_dir, config, verbose):
         print(json.dumps(tf_outputs, indent=2))
         print()
 
-    # Extract relevant IPs and info based on provider
-    # OCI mini uses 'public_ip', medium uses 'web_monitoring_public_ip',
-    # large (split) uses 'web_public_ip'
-    web_ip = tf_outputs.get('web_monitoring_public_ip') or tf_outputs.get('web_public_ip') or tf_outputs.get('public_ip') or tf_outputs.get('server_ip')
-    sbc_ips = tf_outputs.get('sbc_public_ips') or tf_outputs.get('sip_public_ips') or tf_outputs.get('sbc_ips', [])
-    feature_server_mig = tf_outputs.get('feature_server_mig_name')
-    recording_mig = tf_outputs.get('recording_mig_name')
+    # Build the list of servers to test
+    server_list = build_server_list(tf_outputs, tf_dir, provider)
 
-    # Check for mini and large deployments
-    is_mini = 'mini' in str(tf_dir).lower()
-    is_large = 'large' in str(tf_dir).lower()
+    # GCP MIG handling
+    if provider.lower() == 'gcp':
+        server_list = build_server_list_gcp(tf_outputs, tf_dir, server_list)
 
-    if not web_ip:
-        print("❌ Could not find web_monitoring_public_ip, web_public_ip, public_ip, or server_ip in terraform outputs")
+    if not server_list:
+        print("❌ No servers found in terraform outputs")
         sys.exit(1)
 
-    # For mini deployments, the single VM handles everything - no separate SBCs
-    if is_mini and not sbc_ips:
-        sbc_ips = []  # Mini has no separate SBC servers
-
-    if is_mini:
-        print(f"✓ Mini server IP: {web_ip} (all-in-one)")
-    elif is_large:
-        print(f"✓ Web Server IP: {web_ip}")
-        if sbc_ips:
-            print(f"✓ SIP IPs: {', '.join(sbc_ips)}")
-    else:
-        print(f"✓ Web/Monitoring IP: {web_ip}")
-        if sbc_ips:
-            print(f"✓ SBC IPs: {', '.join(sbc_ips)}")
-    if feature_server_mig:
-        print(f"✓ Feature Server MIG: {feature_server_mig}")
-    if recording_mig and recording_mig != "Not deployed":
-        print(f"✓ Recording MIG: {recording_mig}")
+    # Print discovery summary
+    print("Discovered servers:")
+    for entry in server_list:
+        count = len(entry['ips'])
+        suffix = f" ({count} instances)" if count > 1 else ""
+        via = f" (via {entry['jump_host']})" if entry['jump_host'] else ""
+        print(f"  ✓ {entry['label']}{suffix}{via}: {', '.join(entry['ips'])}")
     print()
 
-    # Track results
+    # Run tests
     all_passed = True
+    test_num = 0
 
-    # Test 1: Web/Monitoring Server (or Mini all-in-one)
-    print("=" * 70)
-    if is_mini:
-        print("Test 1: Mini Server (All-in-one)")
-    elif is_large:
-        print("Test 1: Web Server")
-    else:
-        print("Test 1: Web/Monitoring Server")
-    print("=" * 70)
-    print()
+    for entry in server_list:
+        ips = entry['ips']
+        count = len(ips)
 
-    print(f"Testing SSH connectivity to {web_ip}...")
-    if test_ssh_connectivity_wrapper(web_ip, ssh_config):
-        print("✅ SSH connectivity OK")
-    else:
-        print("❌ SSH connectivity FAILED")
-        all_passed = False
-    print()
-
-    print("Checking startup script...")
-    success, message = check_startup_script(web_ip, provider, ssh_config, server_types_config)
-    if success:
-        print(f"✅ {message}")
-    else:
-        print(f"❌ {message}")
-        all_passed = False
-    print()
-
-    # Get expected services from server types config
-    if is_mini:
-        server_type = server_types.get('mini', {})
-    elif is_large:
-        server_type = server_types.get('web', {})
-    else:
-        server_type = server_types.get('web-monitoring', {})
-    expected_systemd = server_type.get('systemd_services', [])
-    expected_pm2 = server_type.get('pm2_processes', [])
-
-    if expected_systemd:
-        print("Checking systemd services...")
-        success, message, details = check_systemd_services(web_ip, expected_systemd, ssh_config, optional_systemd, systemd_aliases)
-        if success:
-            print(f"✅ {message}")
-        else:
-            print(f"❌ {message}")
-            print("  Service status:")
-            for svc, status in details.items():
-                symbol = "✅" if status == "active" else "❌"
-                print(f"    {symbol} {svc}: {status}")
-            all_passed = False
-        print()
-
-    if expected_pm2:
-        print("Checking PM2 services...")
-        success, message, pm2_details = check_pm2_services(web_ip, expected_pm2, ssh_config, optional_pm2)
-        if success:
-            print(f"✅ {message}")
-        else:
-            print(f"❌ {message}")
-            all_passed = False
-
-        if verbose and pm2_details:
-            print()
-            print("PM2 Status:")
-            print("-" * 70)
-            print(pm2_details)
-            print("-" * 70)
-
-    print()
-
-    # Test 2: SBC/SIP Servers (skip for mini deployments)
-    sbc_label = "SIP" if is_large else "SBC"
-    if is_mini:
-        print("=" * 70)
-        print("Test 2: SBC Servers - SKIPPED (mini deployment has all-in-one)")
-        print("=" * 70)
-        print()
-    elif sbc_ips:
-        print("=" * 70)
-        print(f"Test 2: {sbc_label} Servers ({len(sbc_ips)} instance(s))")
-        print("=" * 70)
-        print()
-
-        for idx, sbc_ip in enumerate(sbc_ips, 1):
-            print(f"{sbc_label} {idx}: {sbc_ip}")
-            print("-" * 70)
-
-            print(f"Testing SSH connectivity...")
-            if test_ssh_connectivity_wrapper(sbc_ip, ssh_config):
-                print("✅ SSH connectivity OK")
+        for idx, ip in enumerate(ips):
+            test_num += 1
+            if count > 1:
+                instance_label = f"{entry['label']} {idx + 1} of {count}: {ip}"
             else:
-                print("❌ SSH connectivity FAILED")
+                instance_label = f"{entry['label']}: {ip}"
+
+            print("=" * 70)
+            print(f"Test {test_num}: {instance_label}")
+            print("=" * 70)
+            print()
+
+            passed = test_server(
+                label=instance_label,
+                ip=ip,
+                server_type_name=entry['type'],
+                server_types=server_types,
+                provider=provider,
+                ssh_config=ssh_config,
+                server_types_config=server_types_config,
+                optional_systemd=optional_systemd,
+                optional_pm2=optional_pm2,
+                systemd_aliases=systemd_aliases,
+                verbose=verbose,
+                jump_host=entry['jump_host'],
+                ssh_user=entry['ssh_user'],
+            )
+
+            if not passed:
                 all_passed = False
-            print()
-
-            print("Checking startup script...")
-            success, message = check_startup_script(sbc_ip, provider, ssh_config, server_types_config)
-            if success:
-                print(f"✅ {message}")
-            else:
-                print(f"❌ {message}")
-                all_passed = False
-            print()
-
-            # Get expected services from server types config
-            sbc_type = server_types.get('sip' if is_large else 'sbc', {})
-            expected_systemd = sbc_type.get('systemd_services', [])
-            expected_pm2 = sbc_type.get('pm2_processes', [])
-
-            if expected_systemd:
-                print("Checking systemd services...")
-                success, message, details = check_systemd_services(sbc_ip, expected_systemd, ssh_config, optional_systemd, systemd_aliases)
-                if success:
-                    print(f"✅ {message}")
-                else:
-                    print(f"❌ {message}")
-                    print("  Service status:")
-                    for svc, status in details.items():
-                        symbol = "✅" if status == "active" else "❌"
-                        print(f"    {symbol} {svc}: {status}")
-                    all_passed = False
-                print()
-
-            if expected_pm2:
-                print("Checking PM2 services...")
-                success, message, pm2_details = check_pm2_services(sbc_ip, expected_pm2, ssh_config, optional_pm2)
-                if success:
-                    print(f"✅ {message}")
-                else:
-                    print(f"❌ {message}")
-                    all_passed = False
-
-                if verbose and pm2_details:
-                    print()
-                    print("PM2 Status:")
-                    print("-" * 70)
-                    print(pm2_details)
-                    print("-" * 70)
-
-            print()
-
-    # Test 3: Feature Servers (MIG instances)
-    if provider.lower() == 'gcp' and feature_server_mig:
-        print("=" * 70)
-        print("Test 3: Feature Servers (Managed Instance Group)")
-        print("=" * 70)
-        print()
-
-        # Get project ID from terraform outputs
-        project_id = tf_dir.parent.parent.name  # Try to infer from path
-        if 'project_id' in tf_outputs:
-            project_id = tf_outputs['project_id']
-        elif 'service_account_email' in tf_outputs:
-            # Extract from service account email
-            email = tf_outputs['service_account_email']
-            project_id = email.split('@')[1].split('.')[0]
-
-        # List feature server instances
-        fs_instances = get_mig_instance_ips("name~-fs-", project_id)
-
-        if not fs_instances:
-            print("⚠️  No feature server instances found (may be scaled to 0)")
-            print()
-        else:
-            print(f"Found {len(fs_instances)} feature server instance(s)")
-            print()
-
-            for idx, (name, private_ip) in enumerate(fs_instances, 1):
-                print(f"Feature Server {idx}: {name} ({private_ip})")
-                print("-" * 70)
-
-                print(f"Testing SSH connectivity via jump host {web_ip}...")
-                if test_ssh_connectivity_wrapper(private_ip, ssh_config, jump_host=web_ip):
-                    print("✅ SSH connectivity OK")
-                else:
-                    print("❌ SSH connectivity FAILED")
-                    all_passed = False
-                print()
-
-                print("Checking startup script...")
-                success, message = check_startup_script(private_ip, provider, ssh_config, server_types_config, jump_host=web_ip)
-                if success:
-                    print(f"✅ {message}")
-                else:
-                    print(f"❌ {message}")
-                    all_passed = False
-                print()
-
-                # Get expected services from server types config
-                fs_type = server_types.get('feature-server', {})
-                expected_systemd = fs_type.get('systemd_services', [])
-                expected_pm2 = fs_type.get('pm2_processes', [])
-
-                if expected_systemd:
-                    print("Checking systemd services...")
-                    success, message, details = check_systemd_services(private_ip, expected_systemd, ssh_config, optional_systemd, systemd_aliases, jump_host=web_ip)
-                    if success:
-                        print(f"✅ {message}")
-                    else:
-                        print(f"❌ {message}")
-                        print("  Service status:")
-                        for svc, status in details.items():
-                            symbol = "✅" if status == "active" else "❌"
-                            print(f"    {symbol} {svc}: {status}")
-                        all_passed = False
-                    print()
-
-                if expected_pm2:
-                    print("Checking PM2 services...")
-                    success, message, pm2_details = check_pm2_services(private_ip, expected_pm2, ssh_config, optional_pm2, jump_host=web_ip)
-                    if success:
-                        print(f"✅ {message}")
-                    else:
-                        print(f"❌ {message}")
-                        all_passed = False
-
-                    if verbose and pm2_details:
-                        print()
-                        print("PM2 Status:")
-                        print("-" * 70)
-                        print(pm2_details)
-                        print("-" * 70)
-
-                print()
-
-    # Test 4: Recording Servers (MIG instances)
-    if provider.lower() == 'gcp' and recording_mig and recording_mig != "Not deployed":
-        print("=" * 70)
-        print("Test 4: Recording Servers (Managed Instance Group)")
-        print("=" * 70)
-        print()
-
-        # Use same project_id from above
-        recording_instances = get_mig_instance_ips("name~-recording-", project_id)
-
-        if not recording_instances:
-            print("⚠️  No recording server instances found (may be scaled to 0)")
-            print()
-        else:
-            print(f"Found {len(recording_instances)} recording server instance(s)")
-            print()
-
-            for idx, (name, private_ip) in enumerate(recording_instances, 1):
-                print(f"Recording Server {idx}: {name} ({private_ip})")
-                print("-" * 70)
-
-                print(f"Testing SSH connectivity via jump host {web_ip}...")
-                if test_ssh_connectivity_wrapper(private_ip, ssh_config, jump_host=web_ip):
-                    print("✅ SSH connectivity OK")
-                else:
-                    print("❌ SSH connectivity FAILED")
-                    all_passed = False
-                print()
-
-                print("Checking startup script...")
-                success, message = check_startup_script(private_ip, provider, ssh_config, server_types_config, jump_host=web_ip)
-                if success:
-                    print(f"✅ {message}")
-                else:
-                    print(f"❌ {message}")
-                    all_passed = False
-                print()
-
-                # Get expected services from server types config
-                rec_type = server_types.get('recording', {})
-                expected_systemd = rec_type.get('systemd_services', [])
-                expected_pm2 = rec_type.get('pm2_processes', [])
-
-                if expected_systemd:
-                    print("Checking systemd services...")
-                    success, message, details = check_systemd_services(private_ip, expected_systemd, ssh_config, optional_systemd, systemd_aliases, jump_host=web_ip)
-                    if success:
-                        print(f"✅ {message}")
-                    else:
-                        print(f"❌ {message}")
-                        print("  Service status:")
-                        for svc, status in details.items():
-                            symbol = "✅" if status == "active" else "❌"
-                            print(f"    {symbol} {svc}: {status}")
-                        all_passed = False
-                    print()
-
-                if expected_pm2:
-                    print("Checking PM2 services...")
-                    success, message, pm2_details = check_pm2_services(private_ip, expected_pm2, ssh_config, optional_pm2, jump_host=web_ip)
-                    if success:
-                        print(f"✅ {message}")
-                    else:
-                        print(f"❌ {message}")
-                        all_passed = False
-
-                    if verbose and pm2_details:
-                        print()
-                        print("PM2 Status:")
-                        print("-" * 70)
-                        print(pm2_details)
-                        print("-" * 70)
-
-                print()
 
     # Summary
     print("=" * 70)

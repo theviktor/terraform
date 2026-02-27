@@ -80,7 +80,6 @@ resource "exoscale_compute_instance" "web_monitoring" {
     url_portal               = var.url_portal
     vpc_cidr                 = var.vpc_cidr
     deploy_recording_cluster = var.deploy_recording_cluster
-    apiban_key               = var.apiban_key
     ssh_public_key           = local.ssh_public_key
   })
 
@@ -134,21 +133,23 @@ resource "exoscale_compute_instance" "sbc" {
   ]
 
   user_data = templatefile("${path.module}/cloud-init-sbc.yaml", {
-    mysql_host           = data.exoscale_database_uri.mysql.host
-    mysql_port           = data.exoscale_database_uri.mysql.port
-    mysql_user           = data.exoscale_database_uri.mysql.username
-    mysql_password       = data.exoscale_database_uri.mysql.password
-    mysql_database       = data.exoscale_database_uri.mysql.db_name
-    redis_host           = local.web_monitoring_private_ip
-    redis_port           = 6379
-    jwt_secret           = random_password.encryption_secret.result
-    url_portal           = var.url_portal
-    vpc_cidr             = var.vpc_cidr
-    sbc_index            = count.index + 1
-    ssh_public_key       = local.ssh_public_key
-    apiban_key           = var.apiban_key
-    apiban_client_id     = var.apiban_client_id
-    apiban_client_secret = var.apiban_client_secret
+    mysql_host               = data.exoscale_database_uri.mysql.host
+    mysql_port               = data.exoscale_database_uri.mysql.port
+    mysql_user               = data.exoscale_database_uri.mysql.username
+    mysql_password           = data.exoscale_database_uri.mysql.password
+    mysql_database           = data.exoscale_database_uri.mysql.db_name
+    redis_host               = local.web_monitoring_private_ip
+    redis_port               = 6379
+    jwt_secret               = random_password.encryption_secret.result
+    url_portal               = var.url_portal
+    vpc_cidr                 = var.vpc_cidr
+    sbc_index                = count.index + 1
+    web_monitoring_private_ip = local.web_monitoring_private_ip
+    enable_pcaps             = var.enable_pcaps
+    ssh_public_key           = local.ssh_public_key
+    apiban_key               = var.apiban_key
+    apiban_client_id         = var.apiban_client_id
+    apiban_client_secret     = var.apiban_client_secret
   })
 
   labels = {
@@ -185,17 +186,18 @@ resource "exoscale_instance_pool" "feature_server" {
   ]
 
   user_data = templatefile("${path.module}/cloud-init-feature-server.yaml", {
-    mysql_host               = data.exoscale_database_uri.mysql.host
-    mysql_port               = data.exoscale_database_uri.mysql.port
-    mysql_user               = data.exoscale_database_uri.mysql.username
-    mysql_password           = data.exoscale_database_uri.mysql.password
-    mysql_database           = data.exoscale_database_uri.mysql.db_name
-    redis_host               = local.web_monitoring_private_ip
-    redis_port               = 6379
-    jwt_secret               = random_password.encryption_secret.result
-    url_portal               = var.url_portal
-    vpc_cidr                 = var.vpc_cidr
-    scale_in_timeout_seconds = var.scale_in_timeout_seconds
+    mysql_host                = data.exoscale_database_uri.mysql.host
+    mysql_port                = data.exoscale_database_uri.mysql.port
+    mysql_user                = data.exoscale_database_uri.mysql.username
+    mysql_password            = data.exoscale_database_uri.mysql.password
+    mysql_database            = data.exoscale_database_uri.mysql.db_name
+    redis_host                = local.web_monitoring_private_ip
+    redis_port                = 6379
+    jwt_secret                = random_password.encryption_secret.result
+    url_portal                = var.url_portal
+    vpc_cidr                  = var.vpc_cidr
+    web_monitoring_private_ip = local.web_monitoring_private_ip
+    recording_ws_base_url     = var.deploy_recording_cluster ? "ws://${exoscale_nlb.recording[0].ip_address}:80" : "ws://${local.web_monitoring_private_ip}:3017"
   })
 
   labels = {
@@ -233,16 +235,13 @@ resource "exoscale_instance_pool" "recording" {
   ]
 
   user_data = templatefile("${path.module}/cloud-init-recording.yaml", {
-    mysql_host     = data.exoscale_database_uri.mysql.host
-    mysql_port     = data.exoscale_database_uri.mysql.port
-    mysql_user     = data.exoscale_database_uri.mysql.username
-    mysql_password = data.exoscale_database_uri.mysql.password
-    mysql_database = data.exoscale_database_uri.mysql.db_name
-    redis_host     = local.web_monitoring_private_ip
-    redis_port     = 6379
-    jwt_secret     = random_password.encryption_secret.result
-    url_portal     = var.url_portal
-    vpc_cidr       = var.vpc_cidr
+    mysql_host                = data.exoscale_database_uri.mysql.host
+    mysql_port                = data.exoscale_database_uri.mysql.port
+    mysql_user                = data.exoscale_database_uri.mysql.username
+    mysql_password            = data.exoscale_database_uri.mysql.password
+    mysql_database            = data.exoscale_database_uri.mysql.db_name
+    jwt_secret                = random_password.encryption_secret.result
+    web_monitoring_private_ip = local.web_monitoring_private_ip
   })
 
   labels = {
